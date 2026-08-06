@@ -1,0 +1,3 @@
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o ./build/network-enumerator-linux-amd64 ./cmd/enumerator
+CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o ./build/network-enumerator-mac-arm64 ./cmd/enumerator
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o ./build/network-enumerator-win-amd64.exe ./cmd/enumerator

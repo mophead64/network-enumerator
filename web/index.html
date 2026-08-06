@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Network Enumerator</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div id="loginScreen" class="login-screen" hidden>
+  <form id="loginForm" class="login-card">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <h1>Network Enumerator</h1>
+    </div>
+    <p class="muted small">Sign in to view network data.</p>
+    <label class="field-label" for="loginUsername">Username</label>
+    <input id="loginUsername" autocomplete="username" required>
+    <label class="field-label" for="loginPassword">Password</label>
+    <input id="loginPassword" type="password" autocomplete="current-password" required>
+    <p id="loginError" class="error small" hidden></p>
+    <button type="submit" class="btn btn-primary">Sign in</button>
+  </form>
+</div>
+
+<div class="app" id="app" hidden>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <h1>Network Enumerator</h1>
+    </div>
+
+    <div class="topbar-status">
+      <span id="connState" class="pill pill-muted" title="Live update connection">
+        <span class="dot"></span><span id="connLabel">connecting…</span>
+      </span>
+      <span id="scanState" class="pill pill-muted" title="Scanner status">
+        <span class="dot"></span><span id="scanLabel">idle</span>
+      </span>
+      <span id="lastScan" class="muted small"></span>
+    </div>
+
+    <div class="mini-dash" id="miniDash" title="Click a counter to filter">
+      <button class="dash-tile" id="dashHosts" data-metric="all"><span id="dashHostsCount" class="dash-num">0</span><span class="dash-label">hosts</span></button>
+      <button class="dash-tile dash-tile-critical" id="dashCritical" data-metric="priority"><span id="dashCriticalCount" class="dash-num">0</span><span class="dash-label">priority</span></button>
+      <button class="dash-tile dash-tile-warning" id="dashNew" data-metric="new"><span id="dashNewCount" class="dash-num">0</span><span class="dash-label">new</span></button>
+      <button class="dash-tile" id="dashDown" data-metric="down"><span id="dashDownCount" class="dash-num">0</span><span class="dash-label">down</span></button>
+    </div>
+
+    <div class="topbar-actions">
+      <div class="split-btn">
+        <button id="btnScanNow" class="btn btn-primary split-btn-main">Scan now</button>
+        <button id="btnScanMenuToggle" class="btn btn-primary split-btn-caret" aria-label="More scan options" aria-haspopup="true">▾</button>
+        <div id="scanMenu" class="notif-panel account-menu" hidden>
+          <button id="btnDeepScanAll" class="account-menu-item" title="Scan every TCP port (1-65535) on every host — much slower than a normal scan">Deep scan (all ports)</button>
+        </div>
+      </div>
+      <button id="btnAddSubnet" class="btn">+ Subnet</button>
+      <button id="btnAddHost" class="btn">+ Host</button>
+      <button id="btnTags" class="btn">Tags</button>
+      <div class="notif-wrap">
+        <button id="btnNotifs" class="btn-icon notif-bell" title="Notifications" aria-label="Notifications">
+          🔔<span id="notifBadge" class="notif-badge" hidden>0</span>
+        </button>
+        <div id="notifPanel" class="notif-panel" hidden>
+          <div class="notif-panel-header">
+            <h3>Notifications</h3>
+            <button id="notifClearAll" class="btn-link">Clear all</button>
+          </div>
+          <div id="notifList" class="notif-list"></div>
+        </div>
+      </div>
+      <div class="notif-wrap">
+        <button id="btnAccountMenu" class="btn-icon" title="Account" aria-label="Account menu">⏻</button>
+        <div id="accountMenu" class="notif-panel account-menu" hidden>
+          <button id="btnLogout" class="account-menu-item">Log out</button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="graph-pane">
+      <canvas id="graph"></canvas>
+      <div class="graph-overlay">
+        <div class="legend">
+          <div class="legend-row"><span class="swatch status-good"></span>up</div>
+          <div class="legend-row"><span class="swatch status-critical"></span>down</div>
+          <div class="legend-row"><span class="swatch status-new"></span>new (≤15m)</div>
+          <div class="legend-row"><span class="swatch swatch-subnet"></span>subnet</div>
+          <div class="legend-row"><span class="swatch swatch-bucket"></span>range (click to expand)</div>
+        </div>
+        <button id="btnCollapseAll" type="button" class="btn btn-small graph-collapse-btn">Collapse all</button>
+      </div>
+      <div class="graph-hint muted small">scroll to zoom · drag to pan · drag a node to pin it · click a host for details · click a dashed square to expand a large subnet</div>
+      <div id="emptyState" class="empty-state" hidden>
+        <p>No hosts discovered yet.</p>
+        <p class="muted small">The scanner runs automatically. You can also add a subnet or host manually, or trigger a scan now.</p>
+      </div>
+    </section>
+
+    <aside class="side-pane">
+      <nav class="tabs" role="tablist">
+        <button class="tab active" data-tab="hosts" role="tab">Hosts <span id="countHosts" class="count">0</span></button>
+        <button class="tab" data-tab="subnets" role="tab">Subnets <span id="countSubnets" class="count">0</span></button>
+        <button class="tab" data-tab="settings" role="tab">Settings</button>
+      </nav>
+
+      <div class="tab-panel" id="panel-hosts">
+        <div class="filter-bar">
+          <input id="hostSearch" type="search" placeholder="Search IP, hostname, MAC, vendor, notes, port…">
+          <button id="btnPriorityOnly" type="button" class="chip-toggle" aria-pressed="false">⚑ Priority only</button>
+          <select id="hostSort" title="Sort hosts by">
+            <option value="priority">Sort: Priority first</option>
+            <option value="ip">Sort: IP address</option>
+            <option value="lastSeen">Sort: Last seen</option>
+            <option value="firstSeen">Sort: First seen</option>
+          </select>
+          <div class="filter-menu-wrap">
+            <button id="btnFilters" type="button" class="btn btn-small">Filters <span id="filterActiveCount" class="count" hidden>0</span></button>
+            <div id="filterPanel" class="filter-panel" hidden>
+              <label class="field-label" for="filterSubnet">Subnet</label>
+              <select id="filterSubnet">
+                <option value="">All subnets</option>
+              </select>
+              <label class="field-label" for="filterStatus">Status</label>
+              <select id="filterStatus">
+                <option value="">All status</option>
+                <option value="up">Up</option>
+                <option value="down">Down</option>
+              </select>
+              <label class="field-label" for="filterRisk">Risk level</label>
+              <select id="filterRisk">
+                <option value="">All risk levels</option>
+                <option value="critical">Priority: critical</option>
+                <option value="warning">Priority: warning</option>
+                <option value="info">Priority: info</option>
+                <option value="any">Priority: any flagged</option>
+              </select>
+              <label class="checkbox-inline"><input type="checkbox" id="filterNew"> New only</label>
+              <label class="checkbox-inline"><input type="checkbox" id="filterHideSuspect"> Hide suspect hosts</label>
+              <label class="checkbox-inline"><input type="checkbox" id="filterShowHidden"> Show hidden subnets</label>
+              <label class="field-label">Tags</label>
+              <div id="filterTags" class="filter-tag-list"></div>
+            </div>
+          </div>
+        </div>
+        <div id="hostList" class="host-list"></div>
+      </div>
+
+      <div class="tab-panel" id="panel-subnets" hidden>
+        <div id="subnetList" class="subnet-list"></div>
+      </div>
+
+      <div class="tab-panel" id="panel-settings" hidden>
+        <div class="settings-scroll">
+          <section class="settings-section" hidden>
+            <h3>Account</h3>
+            <p class="muted small">Signed in as <span id="stAccountUsername">—</span></p>
+            <form id="accountForm">
+              <label class="field-label" for="stCurrentPassword">Current password</label>
+              <input id="stCurrentPassword" type="password" autocomplete="current-password" required>
+              <label class="field-label" for="stNewPassword">New password</label>
+              <input id="stNewPassword" type="password" autocomplete="new-password" placeholder="leave blank to keep current">
+              <p id="stAccountError" class="error small" hidden></p>
+              <button type="submit" id="stAccountSubmit" class="btn btn-primary btn-small">Update credentials</button>
+            </form>
+          </section>
+
+          <section class="settings-section">
+            <h3>Scanning</h3>
+            <p class="muted small">Choose how hosts and ports are discovered. <span id="stNmapStatus"></span></p>
+            <label class="field-label" for="stScanMethod">Scan method</label>
+            <select id="stScanMethod">
+              <option value="auto">Auto — nmap if available, otherwise built-in</option>
+              <option value="nmap">nmap</option>
+              <option value="tcp">Built-in (TCP connect + ICMP ping)</option>
+            </select>
+            <p id="stScanMethodError" class="error small" hidden></p>
+          </section>
+
+          <section class="settings-section">
+            <h3>Risky service triage</h3>
+            <p class="muted small">Hosts running any enabled rule below are flagged as priority targets to harden first, and can be filtered above.</p>
+            <div id="riskRuleList" class="risk-rule-list"></div>
+            <button id="btnAddRiskRule" type="button" class="btn btn-small">+ Add rule</button>
+          </section>
+
+          <section class="settings-section settings-danger">
+            <h3>Danger zone</h3>
+            <p class="muted small">Clear every discovered/manual host from inventory. Subnets, tags, and scan history are kept. Type <strong>1001</strong> to confirm.</p>
+            <div class="danger-row">
+              <input id="stClearConfirm" placeholder="1001" inputmode="numeric">
+              <button id="stClearHosts" class="btn btn-danger btn-small" disabled>Clear all hosts</button>
+            </div>
+          </section>
+        </div>
+      </div>
+    </aside>
+  </main>
+</div>
+
+<!-- Host detail modal -->
+<div id="hostModal" class="modal-backdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true">
+    <div class="modal-header">
+      <h2 id="hmIP">host</h2>
+      <button class="btn-icon" id="hmClose" aria-label="Close">✕</button>
+    </div>
+    <div class="modal-body">
+      <div id="hmCallouts"></div>
+      <div id="hmAckRow" class="hm-ack-row" hidden></div>
+      <div class="hm-meta">
+        <div><span class="muted small">Status</span><div id="hmStatus"></div></div>
+        <div><span class="muted small">Hostname</span><div id="hmHostname">—</div></div>
+        <div><span class="muted small">MAC</span><div id="hmMac">—</div></div>
+        <div><span class="muted small">Source</span><div id="hmSource">—</div></div>
+        <div><span class="muted small">First seen</span><div id="hmFirstSeen">—</div></div>
+        <div><span class="muted small">Last seen</span><div id="hmLastSeen">—</div></div>
+      </div>
+
+      <div class="hm-section">
+        <h3>Tags</h3>
+        <div id="hmTags" class="tag-chips"></div>
+        <select id="hmTagAdd"><option value="">+ add tag…</option></select>
+      </div>
+
+      <div class="hm-section">
+        <h3>Open ports <span id="hmPortCount" class="count"></span></h3>
+        <table class="port-table">
+          <thead><tr><th>Port</th><th>Service</th><th>Version</th><th>Banner</th><th></th></tr></thead>
+          <tbody id="hmPorts"></tbody>
+        </table>
+        <button id="hmDeepScan" class="btn btn-small" title="Scan all 65535 TCP ports on this host, not just the common list — slower, run on demand">Deep scan (all ports)</button>
+      </div>
+
+      <div class="hm-section">
+        <h3>Notes</h3>
+        <textarea id="hmNotes" rows="3" placeholder="Notes about this device…"></textarea>
+      </div>
+
+      <div class="hm-section hm-danger">
+        <button id="hmDelete" class="btn btn-danger btn-small">Remove host</button>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <span id="hmUnsavedHint" class="muted small" hidden>Unsaved changes</span>
+      <div class="modal-actions">
+        <button id="hmCancel" class="btn btn-small">Close</button>
+        <button id="hmSave" class="btn btn-primary btn-small">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Add subnet modal -->
+<div id="subnetModal" class="modal-backdrop" hidden>
+  <div class="modal modal-sm" role="dialog" aria-modal="true">
+    <div class="modal-header"><h2>Add subnet</h2><button class="btn-icon" id="smClose" aria-label="Close">✕</button></div>
+    <div class="modal-body">
+      <label class="field-label" for="smCIDR">CIDR</label>
+      <input id="smCIDR" placeholder="10.0.0.0/24">
+      <label class="field-label" for="smName">Name (optional)</label>
+      <input id="smName" placeholder="e.g. Ops VLAN">
+      <p id="smError" class="error small" hidden></p>
+      <button id="smSubmit" class="btn btn-primary">Add & scan</button>
+    </div>
+  </div>
+</div>
+
+<!-- Add host modal -->
+<div id="hostAddModal" class="modal-backdrop" hidden>
+  <div class="modal modal-sm" role="dialog" aria-modal="true">
+    <div class="modal-header"><h2>Add host</h2><button class="btn-icon" id="hamClose" aria-label="Close">✕</button></div>
+    <div class="modal-body">
+      <label class="field-label" for="hamSubnet">Subnet</label>
+      <select id="hamSubnet"></select>
+      <label class="field-label" for="hamIP">IP address</label>
+      <input id="hamIP" placeholder="10.0.0.42">
+      <label class="field-label" for="hamHostname">Hostname (optional)</label>
+      <input id="hamHostname" placeholder="printer-3f">
+      <label class="field-label" for="hamNotes">Notes (optional)</label>
+      <input id="hamNotes" placeholder="">
+      <p id="hamError" class="error small" hidden></p>
+      <button id="hamSubmit" class="btn btn-primary">Add host</button>
+    </div>
+  </div>
+</div>
+
+<!-- Tag manager modal -->
+<div id="tagModal" class="modal-backdrop" hidden>
+  <div class="modal modal-sm" role="dialog" aria-modal="true">
+    <div class="modal-header"><h2>Tags</h2><button class="btn-icon" id="tmClose" aria-label="Close">✕</button></div>
+    <div class="modal-body">
+      <div id="tagManagerList" class="tag-manager-list"></div>
+      <label class="field-label" for="tmName">New tag name</label>
+      <div class="tm-new-row">
+        <input id="tmName" placeholder="e.g. rogue, printer, iot">
+        <button id="tmSubmit" class="btn-add-tag" title="Add tag" aria-label="Add tag">+</button>
+      </div>
+      <div id="tmSwatches" class="swatch-picker"></div>
+    </div>
+    <div class="modal-footer">
+      <span></span>
+      <div class="modal-actions">
+        <button id="tmClose2" class="btn">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Risk rule add/edit modal -->
+<div id="riskRuleModal" class="modal-backdrop" hidden>
+  <div class="modal modal-sm" role="dialog" aria-modal="true">
+    <div class="modal-header"><h2 id="rrmTitle">Add risk rule</h2><button class="btn-icon" id="rrmClose" aria-label="Close">✕</button></div>
+    <div class="modal-body">
+      <label class="field-label" for="rrmPort">Port</label>
+      <input id="rrmPort" type="number" min="1" max="65535" placeholder="e.g. 23">
+      <label class="field-label" for="rrmService">Service name contains (optional)</label>
+      <input id="rrmService" placeholder="e.g. ssh — leave blank to match any service on this port">
+      <label class="field-label" for="rrmLabel">Reason</label>
+      <input id="rrmLabel" placeholder="e.g. Telnet — unencrypted remote access">
+      <label class="field-label">Severity</label>
+      <div id="rrmSeverityPicker" class="severity-picker"></div>
+      <label class="field-label" for="rrmVersionBelow">Flag versions older than (optional, requires nmap)</label>
+      <input id="rrmVersionBelow" placeholder="e.g. 8.0 — leave blank to flag on port/service alone">
+      <label class="checkbox-inline"><input type="checkbox" id="rrmEnabled" checked> Enabled</label>
+      <p id="rrmError" class="error small" hidden></p>
+    </div>
+    <div class="modal-footer">
+      <span></span>
+      <div class="modal-actions">
+        <button id="rrmCancel" class="btn btn-small">Cancel</button>
+        <button id="rrmSubmit" class="btn btn-primary btn-small">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toastContainer" class="toast-container"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
