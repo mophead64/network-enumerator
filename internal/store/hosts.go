@@ -278,6 +278,9 @@ func riskForPorts(ports []model.Port, rules []model.RiskRule) (level string, rea
 	severityRank := map[string]int{"info": 1, "warning": 2, "critical": 3}
 	best := 0
 	for _, p := range ports {
+		if p.State != "open" {
+			continue // a closed port isn't an active exposure, whatever it used to run
+		}
 		for _, r := range rules {
 			if !r.Enabled || r.Port != p.Port {
 				continue

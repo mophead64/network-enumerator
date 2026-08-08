@@ -98,11 +98,16 @@ func (s *Store) SweepClosedPorts(hostID int64, probedPorts, openPorts map[int]bo
 	return closed, nil
 }
 
+// ListPorts returns every port ever recorded open on hostID, regardless of
+// its current state — a port that's since closed stays on the host with
+// State "closed" rather than disappearing, so its history (banner, product,
+// version, first/last seen) isn't lost the moment it stops answering.
+// Open ports sort first, then by port number.
 func (s *Store) ListPorts(hostID int64) ([]model.Port, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	rows, err := s.db.Query(`SELECT id, host_id, port, protocol, state, service, banner, product, version, first_seen, last_seen
-		FROM ports WHERE host_id = ? AND state = 'open' ORDER BY port`, hostID)
+		FROM ports WHERE host_id = ? ORDER BY (state != 'open'), port`, hostID)
 	if err != nil {
 		return nil, err
 	}

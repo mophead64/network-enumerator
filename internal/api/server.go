@@ -63,6 +63,8 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("PATCH /api/risk-rules/{id}", auth(s.updateRiskRule))
 	mux.HandleFunc("DELETE /api/risk-rules/{id}", auth(s.deleteRiskRule))
 
+	mux.HandleFunc("GET /api/export/network-map", auth(s.exportNetworkMap))
+
 	mux.HandleFunc("GET /api/events", auth(s.listEvents))
 	mux.HandleFunc("GET /api/events/stream", auth(s.hub.ServeHTTP))
 

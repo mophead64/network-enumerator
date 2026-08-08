@@ -4,13 +4,24 @@ A self-contained network discovery and enumeration tool. It runs a background sc
 
 > **Authorized use only.** This tool actively probes hosts and ports. Only run it against networks and systems you own or are explicitly authorized to scan.
 
+![Network Enumerator dashboard, showing the live topology graph and host list after scanning several subnets](docs/screenshots/net-scan-overview.png)
+
 ## What it does
 
-- **Discovers subnets automatically** by inspecting the local machine's network interfaces (`-auto-discover-local`), plus lets you add subnets manually by CIDR.
+- **Discovers subnets automatically** by inspecting the local machine's network interfaces (`-auto-discover-local`), plus lets you add subnets manually by CIDR. A subnet with a lot of hosts is automatically split into smaller /24 buckets in the graph so it stays readable — click a bucket to expand it into individual hosts:
+
+  ![A /22 subnet automatically split into three /24 buckets in the graph view](docs/screenshots/subnet-splitting.png)
+
 - **Finds hosts** with ICMP and TCP-based probing, and tracks them as up/down over time (a host is marked down after a configurable number of consecutive missed scans).
-- **Scans ports** against a curated list of common ports on every cycle, with an on-demand deep scan (all 65535 ports, or a full sweep with version detection) per host or across the whole network.
+- **Scans ports** against a curated list of common ports on every cycle, with an on-demand deep scan (all 65535 ports, or a full sweep with version detection) per host or across the whole network. Click any host for its status, tags, open ports (service, version, banner), and notes:
+
+  ![Host detail view showing open ports, service/version info, and the deep scan control](docs/screenshots/viewing-host.png)
+
 - **Uses `nmap` automatically when it's available** on `PATH` for richer results (service/product/version detection via `-sV`), and transparently falls back to a built-in Go TCP/ICMP prober when it isn't — no configuration required, and no root/`CAP_NET_RAW` needed either way.
-- **Flags risky services** with a configurable risk-rules engine (port + optional service substring + optional "version below X" match → critical/warning/info), and flags suspect hosts (e.g. a MAC address answering for an unusually large number of addresses, typical of proxy ARP or a captive network).
+- **Flags risky services** with a configurable risk-rules engine (port + optional service substring + optional "version below X" match → critical/warning/info), and flags suspect hosts (e.g. a MAC address answering for an unusually large number of addresses, typical of proxy ARP or a captive network). Rules ship pre-loaded for common risky services (Telnet, plaintext HTTP, outdated OpenSSH, exposed RDP/VNC, etc.) and are fully editable:
+
+  ![Risk rules list and the add-rule form in Settings](docs/screenshots/risk-rules.png)
+
 - **Serves a live web UI** (dashboard, host list/detail, tagging, acknowledge/triage workflow, risk rules editor, settings) over plain HTTP, pushing updates to connected browsers via Server-Sent Events as scans complete.
 - Ships as **one static binary** with the frontend and a SQLite database engine embedded — nothing to install alongside it.
 
@@ -36,7 +47,7 @@ chmod +x ./network-enumerator-linux-amd64
 
 By default it listens on port `8080` and keeps everything in memory. Open `http://localhost:8080` in a browser.
 
-On startup it prints a short banner (listening address, scan interval, concurrency settings, whether `nmap` was found, whether data is being persisted) and waits ~10 seconds before serving requests, so you have time to read it — scanning itself starts immediately in the background and doesn't wait for the countdown.
+On startup it prints a short banner (listening address, scan interval, concurrency settings, whether `nmap` was found, whether data is being persisted) and starts serving requests immediately — scanning also starts right away in the background.
 
 ### Log in
 

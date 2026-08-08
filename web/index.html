@@ -50,16 +50,17 @@
     </div>
 
     <div class="topbar-actions">
-      <div class="split-btn">
-        <button id="btnScanNow" class="btn btn-primary split-btn-main">Scan now</button>
-        <button id="btnScanMenuToggle" class="btn btn-primary split-btn-caret" aria-label="More scan options" aria-haspopup="true">▾</button>
+      <div class="notif-wrap">
+        <button id="btnScanMenuToggle" class="btn btn-primary" aria-haspopup="true">Scan now ▾</button>
         <div id="scanMenu" class="notif-panel account-menu" hidden>
-          <button id="btnDeepScanAll" class="account-menu-item" title="Scan every TCP port (1-65535) on every host — much slower than a normal scan">Deep scan (all ports)</button>
+          <button id="btnScanNow" class="account-menu-item">Quick scan</button>
+          <button id="btnDeepScanAll" class="account-menu-item" title="Scan every TCP port (1-65535) on every host — much slower than a normal scan">Deep scan (all ports)…</button>
         </div>
       </div>
       <button id="btnAddSubnet" class="btn">+ Subnet</button>
       <button id="btnAddHost" class="btn">+ Host</button>
       <button id="btnTags" class="btn">Tags</button>
+      <a id="btnExport" class="btn" href="/api/export/network-map" title="Download the current network map as JSON">Export JSON</a>
       <div class="notif-wrap">
         <button id="btnNotifs" class="btn-icon notif-bell" title="Notifications" aria-label="Notifications">
           🔔<span id="notifBadge" class="notif-badge" hidden>0</span>
@@ -228,9 +229,9 @@
       </div>
 
       <div class="hm-section">
-        <h3>Open ports <span id="hmPortCount" class="count"></span></h3>
+        <h3>Ports <span id="hmPortCount" class="count"></span></h3>
         <table class="port-table">
-          <thead><tr><th>Port</th><th>Service</th><th>Version</th><th>Banner</th><th></th></tr></thead>
+          <thead><tr><th>Port</th><th>Status</th><th>Service</th><th>Version</th><th>Banner</th><th></th></tr></thead>
           <tbody id="hmPorts"></tbody>
         </table>
         <button id="hmDeepScan" class="btn btn-small" title="Scan all 65535 TCP ports on this host, not just the common list — slower, run on demand">Deep scan (all ports)</button>
@@ -334,6 +335,24 @@
       <div class="modal-actions">
         <button id="rrmCancel" class="btn btn-small">Cancel</button>
         <button id="rrmSubmit" class="btn btn-primary btn-small">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Deep scan confirm modal -->
+<div id="deepScanModal" class="modal-backdrop" hidden>
+  <div class="modal modal-sm" role="dialog" aria-modal="true">
+    <div class="modal-header"><h2>Deep scan all hosts</h2><button class="btn-icon" id="dsmClose" aria-label="Close">✕</button></div>
+    <div class="modal-body">
+      <p>This scans every TCP port (1–65535) on every host instead of the usual common-port list. It can take a long time on a large network, and it blocks the normal scheduled scan cycle from running until it finishes.</p>
+      <label class="checkbox-inline checkbox-wrap"><input type="checkbox" id="dsmConfirm"> I understand this will take a while and block normal scanning</label>
+    </div>
+    <div class="modal-footer">
+      <span></span>
+      <div class="modal-actions">
+        <button id="dsmCancel" class="btn btn-small">Cancel</button>
+        <button id="dsmProceed" class="btn btn-danger btn-small" disabled>Start deep scan</button>
       </div>
     </div>
   </div>

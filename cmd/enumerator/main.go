@@ -8,7 +8,6 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -74,18 +73,9 @@ func main() {
 	scanner := discovery.NewScanner(st, cfg, func(ev model.Event) { hub.Broadcast(ev) })
 	defer scanner.Close()
 
-	// Start scanning immediately rather than waiting on the startup banner's
-	// countdown below — that countdown exists purely so someone parachuting
-	// this onto an unfamiliar box has time to read the config/credentials
-	// summary before request logs start scrolling under it. There's no
-	// reason actual discovery should sit idle for it too; subnets get
-	// identified and scanning begins in the background while the banner is
-	// still counting down.
 	go scanner.Run(ctx)
 
-	if !printStartupBanner(ctx, addr, dbPath, cfg, st.UsingDefaultCredentials()) {
-		return // interrupted during the countdown, e.g. Ctrl-C
-	}
+	printStartupBanner(addr, dbPath, cfg, st.UsingDefaultCredentials())
 
 	mux := http.NewServeMux()
 	api.New(st, scanner, hub).Routes(mux)
@@ -138,19 +128,9 @@ func (w *statusWriter) WriteHeader(status int) {
 	w.ResponseWriter.WriteHeader(status)
 }
 
-// startupCountdown is how long the config/credentials summary stays on
-// screen before the server actually starts listening. Long enough for
-// someone parachuting this onto an unfamiliar box to actually read it before
-// request logs start scrolling past underneath it.
-const startupCountdown = 10 * time.Second
-
 // printStartupBanner logs the effective configuration and, if the account
-// still has the out-of-the-box credentials, a reminder to change them —
-// then holds for startupCountdown so both are visible before the request
-// log starts scrolling. Returns false if ctx was cancelled during the
-// countdown (e.g. Ctrl-C), in which case the caller should exit immediately
-// rather than go on to start the server.
-func printStartupBanner(ctx context.Context, addr, dbPath string, cfg discovery.Config, usingDefaultCreds bool) bool {
+// still has the out-of-the-box credentials, a reminder to change them.
+func printStartupBanner(addr, dbPath string, cfg discovery.Config, usingDefaultCreds bool) {
 	log.Printf("network-enumerator starting — listen %s, scan interval %s, host concurrency %d, port concurrency %d, miss threshold %d, auto-discover local subnets %t",
 		addr, cfg.Interval, cfg.HostConcurrency, cfg.PortConcurrency, cfg.MissThreshold, cfg.AutoDiscoverLocal)
 	if nmapPath, ok := discovery.NmapPath(); ok {
@@ -166,44 +146,6 @@ func printStartupBanner(ctx context.Context, addr, dbPath string, cfg discovery.
 	if usingDefaultCreds {
 		log.Printf("login is still set to the built-in default credentials — restart with -password (or $ADMIN_PASSWORD) to set a real one")
 	}
-
-	// A redirected/piped log (Docker, a file, `| tee`) can't usefully rewrite
-	// a line in place — each "\r" would just land as another line in the
-	// output — so there it's one message instead of a per-second countdown.
-	if !isTerminal(os.Stdout) {
-		log.Printf("starting in %d seconds...", int(startupCountdown.Seconds()))
-		select {
-		case <-time.After(startupCountdown):
-		case <-ctx.Done():
-			log.Printf("startup interrupted")
-			return false
-		}
-		return true
-	}
-
-	for remaining := int(startupCountdown.Seconds()); remaining > 0; remaining-- {
-		fmt.Fprintf(os.Stdout, "\rstarting in %ds…   ", remaining)
-		select {
-		case <-time.After(time.Second):
-		case <-ctx.Done():
-			fmt.Fprintln(os.Stdout)
-			log.Printf("startup interrupted")
-			return false
-		}
-	}
-	fmt.Fprint(os.Stdout, "\r")
-	return true
-}
-
-// isTerminal reports whether f looks like an interactive terminal rather
-// than a pipe, redirected file, or Docker's log collector — the cases where
-// overwriting a line with "\r" wouldn't render as intended.
-func isTerminal(f *os.File) bool {
-	info, err := f.Stat()
-	if err != nil {
-		return false
-	}
-	return info.Mode()&os.ModeCharDevice != 0
 }
 
 func envOr(key, def string) string {

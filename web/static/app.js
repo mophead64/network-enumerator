@@ -739,11 +739,12 @@ function renderHostList() {
   }
   for (const h of hosts) {
     const sn = subnetById(h.subnetId);
+    const openPortCount = (h.ports || []).filter((p) => p.state === "open").length;
     const row = el("div", { class: "host-row", onclick: () => openHostModal(h.id) }, [
       el("span", { class: "status-dot", style: `background:${h.status === "down" ? "var(--status-critical)" : "var(--status-good)"}` }),
       el("div", { class: "host-main" }, [
         el("div", { class: "host-ip" }, [h.ip + (h.hostname ? "  " : ""), h.hostname ? el("span", { class: "muted", text: h.hostname }) : null]),
-        el("div", { class: "host-sub" }, [sn ? sn.cidr : "", h.ports && h.ports.length ? ` · ${h.ports.length} open port${h.ports.length === 1 ? "" : "s"}` : ""]),
+        el("div", { class: "host-sub" }, [sn ? sn.cidr : "", openPortCount ? ` · ${openPortCount} open port${openPortCount === 1 ? "" : "s"}` : ""]),
       ]),
       ...(h.tags || []).slice(0, 3).map((t) => el("span", { class: "tag-dot", style: `background:${t.color}`, title: t.name })),
       h.riskLevel ? riskBadge(h.riskLevel, h.riskReasons, h.acknowledged) : null,
@@ -988,12 +989,17 @@ function openHostModal(hostId) {
 
   const portsBody = qs("#hmPorts");
   portsBody.innerHTML = "";
-  const ports = (h.ports || []).slice().sort((a, b) => a.port - b.port);
+  const ports = (h.ports || []).slice().sort((a, b) => {
+    if (a.state !== b.state) return a.state === "open" ? -1 : 1;
+    return a.port - b.port;
+  });
   qs("#hmPortCount").textContent = ports.length ? `(${ports.length})` : "";
   for (const p of ports) {
     const version = [p.product, p.version].filter(Boolean).join(" ");
-    portsBody.appendChild(el("tr", {}, [
+    const isClosed = p.state !== "open";
+    portsBody.appendChild(el("tr", { class: isClosed ? "port-row-closed" : "" }, [
       el("td", { text: `${p.port}/${p.protocol}` }),
+      el("td", {}, [el("span", { class: "pill " + (isClosed ? "pill-muted" : "pill-good") }, [el("span", { class: "dot" }), p.state])]),
       el("td", { text: p.service || "—" }),
       el("td", { text: version || "—", class: "muted small" }),
       el("td", { text: p.banner || "—", class: "muted small" }),
@@ -1357,12 +1363,6 @@ function wireGraphControls() {
 }
 
 function wireTopbar() {
-  qs("#btnScanNow").addEventListener("click", async () => {
-    await Api.scanNow();
-    pollScanStatus();
-    toast("Scan triggered.");
-  });
-
   const scanMenu = qs("#scanMenu");
   qs("#btnScanMenuToggle").addEventListener("click", (e) => {
     e.stopPropagation();
@@ -1370,11 +1370,18 @@ function wireTopbar() {
   });
   scanMenu.addEventListener("click", (e) => e.stopPropagation());
   document.addEventListener("click", () => { scanMenu.hidden = true; });
-  qs("#btnDeepScanAll").addEventListener("click", async () => {
+
+  qs("#btnScanNow").addEventListener("click", async () => {
     scanMenu.hidden = true;
-    await Api.deepScanAll();
+    await Api.scanNow();
     pollScanStatus();
-    toast("Deep scan triggered — scanning every port on every host. This can take a long time on a large network.", "warn");
+    toast("Scan triggered.");
+  });
+  qs("#btnDeepScanAll").addEventListener("click", () => {
+    scanMenu.hidden = true;
+    qs("#dsmConfirm").checked = false;
+    qs("#dsmProceed").disabled = true;
+    showModal("#deepScanModal");
   });
 
   qs("#btnAddSubnet").addEventListener("click", () => { qs("#smError").hidden = true; qs("#smCIDR").value = ""; qs("#smName").value = ""; showModal("#subnetModal"); });
@@ -1584,6 +1591,24 @@ function wireRiskRuleModal() {
   });
 }
 
+/* ---------------------------------------------------------------------- */
+/* deep scan confirm modal                                               */
+/* ---------------------------------------------------------------------- */
+
+function wireDeepScanModal() {
+  wireModal("#deepScanModal", "#dsmClose");
+  qs("#dsmConfirm").addEventListener("change", (e) => {
+    qs("#dsmProceed").disabled = !e.target.checked;
+  });
+  qs("#dsmCancel").addEventListener("click", () => closeModal("#deepScanModal"));
+  qs("#dsmProceed").addEventListener("click", async () => {
+    closeModal("#deepScanModal");
+    await Api.deepScanAll();
+    pollScanStatus();
+    toast("Deep scan triggered — scanning every port on every host. This can take a long time on a large network.", "warn");
+  });
+}
+
 function wireSettings() {
   qs("#accountForm").addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -1710,6 +1735,7 @@ async function startApp() {
   wireTagManager();
   wireSettings();
   wireRiskRuleModal();
+  wireDeepScanModal();
   wireModal("#hostModal", "#hmClose");
 
   await loadAppData();
