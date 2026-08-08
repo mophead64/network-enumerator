@@ -207,6 +207,10 @@ const state = {
   // animated canvas and the static one, so expanding a bucket in one is
   // reflected in the other.
   expandedBuckets: new Set(),
+  // Subnet keys collapsed in either graph view — inverse sense of
+  // expandedBuckets (subnets default to expanded, so this tracks the
+  // exception), but otherwise the same shared-between-both-views deal.
+  collapsedSubnets: new Set(),
   notifDismissed: new Set(), // event ids the user has cleared from the bell panel
   notifUnread: new Set(), // event ids not yet seen (drives the bell badge count)
   pendingTagAdds: [], // staged in the host modal until Save is clicked
@@ -354,6 +358,7 @@ class Graph {
     const n = this._nodeAt(sx, sy);
     if (n && n.type === "host") openHostModal(n.hostId);
     else if (n && n.type === "bucket") this.toggleBucket(n.key);
+    else if (n && n.type === "subnet") this.toggleSubnet(n.key);
   }
 
   _onDblClick(e) {
@@ -472,7 +477,12 @@ class Graph {
     for (const sn of subnets) {
       const subnetKey = "subnet:" + sn.id;
       const subnetHosts = bySubnet.get(sn.id) || [];
-      this._layoutLevel(subnetKey, subnetHosts, cidrPrefix(sn.cidr), sn.id, nextKeys, cx, cy);
+      const node = this.nodes.get(subnetKey);
+      node.count = subnetHosts.length;
+      node.expanded = !state.collapsedSubnets.has(subnetKey);
+      if (node.expanded) {
+        this._layoutLevel(subnetKey, subnetHosts, cidrPrefix(sn.cidr), sn.id, nextKeys, cx, cy);
+      }
     }
 
     for (const key of Array.from(this.nodes.keys())) {
@@ -489,15 +499,15 @@ class Graph {
    * as a separate pass since the tree layout below needs the whole shape
    * (to compute subtree widths) before it can place anything, unlike the
    * physics layout which only needs a rough starting point per node.
-   * Subnets always expand (no top-level collapse, matching the animated
-   * view); buckets expand only via the same state.expandedBuckets the
-   * animated view's bucket click-to-expand uses. */
+   * Subnets expand unless collapsed via state.collapsedSubnets; buckets
+   * expand only via the same state.expandedBuckets the animated view's
+   * bucket click-to-expand uses — both sets are shared between views. */
   _buildLogicalTree(key, type, data, hosts, prefix, subnetId) {
     const node = { key, type, data, subnetId, children: [] };
     if (type === "host") return node;
 
     node.count = hosts.length;
-    node.expanded = type === "subnet" || state.expandedBuckets.has(key);
+    node.expanded = type === "subnet" ? !state.collapsedSubnets.has(key) : state.expandedBuckets.has(key);
     if (node.expanded) {
       const level = nextTreeLevel(hosts, prefix);
       node.children = !level
@@ -560,6 +570,9 @@ class Graph {
         cn.cidr = node.data.cidr;
         cn.count = node.count;
         cn.expanded = node.expanded;
+      } else if (node.type === "subnet") {
+        cn.count = node.count;
+        cn.expanded = node.expanded;
       }
       if (parentKey) this.links.push({ a: parentKey, b: node.key });
       node.children.forEach((c) => place(c, node.key));
@@ -578,6 +591,12 @@ class Graph {
   toggleBucket(bucketKey) {
     if (state.expandedBuckets.has(bucketKey)) state.expandedBuckets.delete(bucketKey);
     else state.expandedBuckets.add(bucketKey);
+    renderGraph();
+  }
+
+  toggleSubnet(subnetKey) {
+    if (state.collapsedSubnets.has(subnetKey)) state.collapsedSubnets.delete(subnetKey);
+    else state.collapsedSubnets.add(subnetKey);
     renderGraph();
   }
 
@@ -708,12 +727,19 @@ class Graph {
         ctx.strokeRect(-node.r, -node.r, node.r * 2, node.r * 2);
         ctx.fillStyle = surface1;
         ctx.fillRect(-node.r + 1, -node.r + 1, node.r * 2 - 2, node.r * 2 - 2);
+        ctx.fillStyle = muted;
+        ctx.font = `600 ${11 / this.transform.k}px system-ui, sans-serif`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(node.expanded ? "−" : "+", 0, 0);
+        ctx.textBaseline = "alphabetic";
         ctx.restore();
         if (this.transform.k > 0.35) {
           ctx.fillStyle = muted;
           ctx.font = `${11 / this.transform.k}px system-ui, sans-serif`;
           ctx.textAlign = "center";
-          ctx.fillText(node.data ? node.data.cidr : "", node.x, node.y - node.r - 6 / this.transform.k);
+          const label = node.data ? `${node.data.cidr} (${node.count || 0})` : "";
+          ctx.fillText(label, node.x, node.y - node.r - 6 / this.transform.k);
         }
         continue;
       }
@@ -1510,8 +1536,8 @@ function wireNotifications() {
 
 function wireGraphControls() {
   qs("#btnCollapseAll").addEventListener("click", () => {
-    if (state.expandedBuckets.size === 0) return;
     state.expandedBuckets.clear();
+    for (const sn of state.subnets) state.collapsedSubnets.add("subnet:" + sn.id);
     renderGraph();
   });
 }
@@ -1683,9 +1709,10 @@ function renderScanMethodSettings(settings) {
  * -ldflags in build.sh) rather than read from a sidecar file — a `go run`/
  * plain `go build` without those flags shows "dev"/"unknown", which is the
  * signal that you're not looking at a real release build. */
-/** Shared by the Settings-tab footer (post-login, from /api/settings) and
+/** Used by the Settings-tab footer (post-login, from /api/settings) and
  * the login screen (pre-login, from the unauthenticated /api/healthz) —
- * same version/buildDate fields either way. */
+ * same version/buildDate fields either way, but the login screen only
+ * shows the version (see loadLoginVersionInfo), not the build date. */
 function versionInfoText(info) {
   const built = new Date(info.buildDate);
   const builtStr = isNaN(built) ? info.buildDate : built.toLocaleString();
@@ -1700,11 +1727,13 @@ function renderVersionInfo(settings) {
  * authenticated /api/settings — it hits /api/healthz instead, which
  * exposes the same version/buildDate without requiring auth. Best-effort:
  * if it fails for any reason, the login screen just shows no version line
- * rather than blocking sign-in over it. */
+ * rather than blocking sign-in over it. Deliberately version-only (no build
+ * date) here — the full "version · built <date>" form is reserved for the
+ * Settings footer post-login. */
 async function loadLoginVersionInfo() {
   try {
     const info = await Api.healthz();
-    qs("#loginVersionInfo").textContent = versionInfoText(info);
+    qs("#loginVersionInfo").textContent = `Network Enumerator ${info.version}`;
   } catch (_) {
     // not worth surfacing — signing in still works without it
   }

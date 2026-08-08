@@ -26,6 +26,41 @@ var defaultRiskRules = []model.RiskRule{
 	{Port: 3389, Severity: "critical", Label: "RDP — high-value target, patch and restrict access", Enabled: true},
 	{Port: 22, Severity: "info", Label: "SSH exposed — verify key-only auth and patch level", Enabled: true},
 
+	// Added alongside the port-list expansion in internal/discovery/ports.go —
+	// same "legacy/unencrypted" and "high-value/frequently-exploited target"
+	// criteria as the rules above, not every newly-scanned port. Deliberately
+	// skips ports that are ubiquitous/expected protocol noise (DHCP, NTP) or
+	// plain aliases of an already-covered service (e.g. generic http-alt/
+	// https-alt ports, TLS variants of a port already listed here).
+	{Port: 69, Severity: "critical", Label: "TFTP — unauthenticated, unencrypted file transfer; a common vector for pulling/pushing network device configs", Enabled: true},
+	{Port: 49, Severity: "warning", Label: "TACACS+ — network device AAA traffic; its body \"encryption\" is a weak proprietary scheme, not real crypto — treat as sensitive outside management networks", Enabled: true},
+	{Port: 137, Severity: "warning", Label: "NetBIOS Name Service — legacy Windows service, same lateral-movement/enumeration exposure as NetBIOS session service (139)", Enabled: true},
+	{Port: 138, Severity: "warning", Label: "NetBIOS Datagram Service — legacy Windows service, same lateral-movement/enumeration exposure as NetBIOS session service (139)", Enabled: true},
+	{Port: 162, Severity: "warning", Label: "SNMP trap receiver — same default-community-string exposure as SNMP (161)", Enabled: true},
+	{Port: 623, Severity: "critical", Label: "IPMI — historically shipped with a cipher-zero auth bypass and default credentials (CVE-2013-4786); a frequent out-of-band management target", Enabled: true},
+	{Port: 873, Severity: "warning", Label: "rsync daemon — can allow anonymous read/write to configured modules if access controls aren't set", Enabled: true},
+	{Port: 1701, Severity: "warning", Label: "L2TP — provides no encryption on its own; verify it's always paired with IPsec, not run bare", Enabled: true},
+	{Port: 2379, Severity: "critical", Label: "etcd client API — repeatedly found exposed without authentication in the wild, exposing the full cluster key/value store including secrets; verify auth is enabled", Enabled: true},
+	{Port: 2380, Severity: "warning", Label: "etcd peer API — cluster-internal port; exposure suggests the etcd cluster is reachable beyond its intended peers", Enabled: true},
+	{Port: 4243, Severity: "critical", Label: "Docker remote API (legacy alt port) — unauthenticated by default; full container/host RCE if reachable without TLS+auth", Enabled: true},
+	{Port: 500, Severity: "info", Label: "ISAKMP/IKE — IPsec VPN negotiation endpoint; expected on VPN gateways, verify only intended peers can reach it", Enabled: true},
+	{Port: 4500, Severity: "info", Label: "IPsec NAT-T — VPN negotiation endpoint; expected on VPN gateways, verify only intended peers can reach it", Enabled: true},
+	{Port: 1194, Severity: "info", Label: "OpenVPN — VPN tunnel endpoint; expected on VPN gateways, verify only intended peers can reach it", Enabled: true},
+	{Port: 5060, Severity: "warning", Label: "SIP — VoIP signaling, frequent target for toll-fraud and extension enumeration; verify auth and restrict access", Enabled: true},
+	{Port: 5902, Severity: "critical", Label: "VNC — often unauthenticated remote desktop", Enabled: true},
+	{Port: 5903, Severity: "critical", Label: "VNC — often unauthenticated remote desktop", Enabled: true},
+	{Port: 8001, Severity: "warning", Label: "Kubernetes API (alt port) — cluster control surface; verify RBAC/auth and restrict access", Enabled: true},
+	{Port: 8291, Severity: "critical", Label: "MikroTik Winbox — target of the CVE-2018-14847 credential-disclosure exploit used in real-world router botnets; verify RouterOS is patched", Enabled: true},
+	{Port: 8728, Severity: "warning", Label: "MikroTik RouterOS API — frequent brute-force/config-exfiltration target; restrict access", Enabled: true},
+	{Port: 8729, Severity: "info", Label: "MikroTik RouterOS API (SSL) — encrypted variant of the RouterOS API; still worth restricting to known management hosts", Enabled: true},
+	{Port: 9090, Severity: "warning", Label: "Prometheus — no authentication by default; can leak internal topology and metrics if reachable", Enabled: true},
+	{Port: 10000, Severity: "critical", Label: "Webmin — versions before 1.930 shipped a backdoored password-reset flow (CVE-2019-15107) allowing unauthenticated RCE; verify patch level", Enabled: true},
+	{Port: 10255, Severity: "critical", Label: "Kubelet read-only port — historically unauthenticated pod enumeration/exec; deprecated and should be disabled or firewalled", Enabled: true},
+	{Port: 10257, Severity: "warning", Label: "kube-controller-manager — Kubernetes control-plane component; exposure suggests the control plane is reachable beyond intended nodes", Enabled: true},
+	{Port: 10259, Severity: "warning", Label: "kube-scheduler — Kubernetes control-plane component; exposure suggests the control plane is reachable beyond intended nodes", Enabled: true},
+	{Port: 27018, Severity: "critical", Label: "MongoDB — repeatedly targeted in mass unauthenticated-access ransomware/wipe campaigns; verify auth is enabled and it isn't bound to a public interface", Enabled: true},
+	{Port: 50000, Severity: "warning", Label: "DB2 — direct database exposure; verify authentication and restrict network access", Enabled: true},
+
 	// Known-vulnerable version thresholds for common services, only usable
 	// against nmap's version detection (a port with no detected Version
 	// never matches these — see riskForPorts). The version string a service
