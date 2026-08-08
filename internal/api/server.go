@@ -7,6 +7,7 @@ import (
 	"network-enumerator/internal/auth"
 	"network-enumerator/internal/discovery"
 	"network-enumerator/internal/store"
+	"network-enumerator/internal/version"
 )
 
 type Server struct {
@@ -26,7 +27,14 @@ func New(st *store.Store, scanner *discovery.Scanner, hub *Hub) *Server {
 func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/auth/login", s.login)
 	mux.HandleFunc("GET /api/healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		// version/buildDate are exposed here (rather than only via the
+		// authenticated /api/settings) so the login screen can show them
+		// before anyone's signed in — build info isn't sensitive.
+		writeJSON(w, http.StatusOK, map[string]string{
+			"status":    "ok",
+			"version":   version.Version,
+			"buildDate": version.BuildDate,
+		})
 	})
 
 	auth := s.requireAuth

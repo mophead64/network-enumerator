@@ -236,6 +236,50 @@ func (s *Scanner) scanSubnet(ctx context.Context, sn model.Subnet, deep bool) in
 	return s.scanSubnetTCP(ctx, sn, deep)
 }
 
+// netdiscoverPath resolves whether ARP-based discovery via netdiscover
+// should run this cycle: the operator's enabled/disabled preference
+// (defaulting to true — use it automatically when present, same default
+// nmap gets) combined with whether the binary is actually on PATH.
+func (s *Scanner) netdiscoverPath() (path string, ok bool) {
+	enabled, err := s.st.GetNetdiscoverEnabled()
+	if err != nil {
+		log.Printf("read netdiscover setting: %v", err)
+		enabled = true
+	}
+	if !enabled {
+		return "", false
+	}
+	return NetdiscoverPath()
+}
+
+// netdiscoverAugment runs an ARP sweep of sn via netdiscover and returns
+// whatever it found, keyed by IP. It's only meaningful for subnets this host
+// is directly attached to (sn.Iface, set by LocalSubnets() for auto-detected
+// local subnets) — ARP doesn't route, so netdiscover has nothing to offer on
+// a routed or manually-added subnet reached through a gateway. Failures are
+// logged and swallowed: netdiscover is a supplementary source on top of the
+// built-in TCP/ICMP prober, never the only way a host gets found.
+func (s *Scanner) netdiscoverAugment(ctx context.Context, sn model.Subnet) map[string]NetdiscoverHost {
+	if sn.Iface == "" {
+		return nil
+	}
+	path, ok := s.netdiscoverPath()
+	if !ok {
+		return nil
+	}
+	const timeout = 20 * time.Second
+	hosts, err := RunNetdiscover(ctx, path, sn.Iface, sn.CIDR, timeout)
+	if err != nil {
+		log.Printf("netdiscover %s: %v", sn.CIDR, err)
+		return nil
+	}
+	found := make(map[string]NetdiscoverHost, len(hosts))
+	for _, h := range hosts {
+		found[h.IP] = h
+	}
+	return found
+}
+
 // discoverAliveHosts fans the same fast TCP/ICMP probe scanSubnetTCP uses
 // out across every address in cidr and returns the ones that answered.
 // scanSubnetNmap runs this first and hands nmap only the resulting list
@@ -310,6 +354,23 @@ func (s *Scanner) scanSubnetNmap(ctx context.Context, sn model.Subnet, deep bool
 	if err := s.st.TouchSubnetScan(sn.ID); err != nil {
 		log.Printf("touch subnet scan: %v", err)
 	}
+
+	// ARP-only hosts (filtered ICMP/TCP but still answering ARP) never show
+	// up in the built-in prober's alive list, so netdiscover's finds are
+	// unioned in here rather than only used to enrich hosts already found.
+	ndHosts := s.netdiscoverAugment(ctx, sn)
+	if len(ndHosts) > 0 {
+		aliveSet := make(map[string]bool, len(alive))
+		for _, ip := range alive {
+			aliveSet[ip] = true
+		}
+		for ip := range ndHosts {
+			if !aliveSet[ip] {
+				alive = append(alive, ip)
+			}
+		}
+	}
+
 	if len(alive) == 0 {
 		s.emitHostDownEvents(sn, map[string]bool{})
 		return 0
@@ -339,7 +400,14 @@ func (s *Scanner) scanSubnetNmap(ctx context.Context, sn model.Subnet, deep bool
 			defer wg.Done()
 			defer func() { <-sem }()
 			mac := arpTable[ip]
-			hostID, err := s.recordHost(sn.ID, ip, mac, s.reverseDNS(ip))
+			vendor := ""
+			if nd, ok := ndHosts[ip]; ok {
+				if mac == "" {
+					mac = nd.MAC
+				}
+				vendor = nd.Vendor
+			}
+			hostID, err := s.recordHost(sn.ID, ip, mac, s.reverseDNS(ip), vendor)
 			if err != nil {
 				log.Printf("upsert host %s: %v", ip, err)
 				return
@@ -389,6 +457,15 @@ func (s *Scanner) scanSubnetNmap(ctx context.Context, sn model.Subnet, deep bool
 		if !ok {
 			continue
 		}
+		// nmap's ARP host-discovery (used implicitly for local targets) reports
+		// MAC/vendor in its XML output; UpsertHost only touches non-empty
+		// fields, so this only ever fills in what ARPTable()/netdiscover missed
+		// above, never overwrites a value they already found.
+		if h.MAC != "" || h.Vendor != "" {
+			if _, _, err := s.st.UpsertHost(sn.ID, h.IP, h.MAC, "", h.Vendor); err != nil {
+				log.Printf("update host mac/vendor %s: %v", h.IP, err)
+			}
+		}
 		for _, p := range h.Ports {
 			s.recordOpenPort(hostID, h.IP, p.Port, p.Service, p.Banner, p.Product, p.Version)
 			enriched++
@@ -406,6 +483,11 @@ func (s *Scanner) scanSubnetTCP(ctx context.Context, sn model.Subnet, deep bool)
 		return 0
 	}
 
+	// ARP-only hosts (filtered ICMP/TCP but still answering ARP) never pass
+	// isAlive() below; netdiscover's finds let probeAndRecord count them
+	// anyway, using its MAC/vendor since ARPTable() alone can't supply either.
+	ndHosts := s.netdiscoverAugment(ctx, sn)
+
 	seen := make(map[string]bool)
 	var seenMu sync.Mutex
 	var macMu sync.Mutex
@@ -421,7 +503,7 @@ func (s *Scanner) scanSubnetTCP(ctx context.Context, sn model.Subnet, deep bool)
 		go func(ipStr string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			alive, hadOpenPort, mac := s.probeAndRecord(ctx, sn, ipStr, deep)
+			alive, hadOpenPort, mac := s.probeAndRecord(ctx, sn, ipStr, deep, ndHosts)
 			if !alive {
 				return
 			}
@@ -512,15 +594,19 @@ func (s *Scanner) emitHostDownEvents(sn model.Subnet, seen map[string]bool) {
 // scans its ports. It returns (alive, hadOpenPort, mac) — hadOpenPort and
 // mac are only meaningful when alive is true, and both feed scanSubnet's
 // anomaly checks.
-func (s *Scanner) probeAndRecord(ctx context.Context, sn model.Subnet, ip string, deep bool) (bool, bool, string) {
-	if !s.isAlive(ip) {
+func (s *Scanner) probeAndRecord(ctx context.Context, sn model.Subnet, ip string, deep bool, ndHosts map[string]NetdiscoverHost) (bool, bool, string) {
+	nd, foundByND := ndHosts[ip]
+	if !s.isAlive(ip) && !foundByND {
 		return false, false, ""
 	}
 
 	hostname := s.reverseDNS(ip)
 	mac := ARPTable()[ip]
+	if mac == "" {
+		mac = nd.MAC
+	}
 
-	hostID, err := s.recordHost(sn.ID, ip, mac, hostname)
+	hostID, err := s.recordHost(sn.ID, ip, mac, hostname, nd.Vendor)
 	if err != nil {
 		log.Printf("upsert host %s: %v", ip, err)
 		return true, false, mac
@@ -533,8 +619,8 @@ func (s *Scanner) probeAndRecord(ctx context.Context, sn model.Subnet, ip string
 // recordHost upserts a host and, if it's newly seen, emits the new_host
 // event — shared by the built-in prober and the nmap scan path so both
 // produce identical events for the same discovery.
-func (s *Scanner) recordHost(subnetID int64, ip, mac, hostname string) (hostID int64, err error) {
-	hostID, isNew, err := s.st.UpsertHost(subnetID, ip, mac, hostname)
+func (s *Scanner) recordHost(subnetID int64, ip, mac, hostname, vendor string) (hostID int64, err error) {
+	hostID, isNew, err := s.st.UpsertHost(subnetID, ip, mac, hostname, vendor)
 	if err != nil {
 		return 0, err
 	}

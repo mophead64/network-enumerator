@@ -16,9 +16,12 @@ import (
 // of addresses that aren't real distinct hosts.
 const suspectMACThreshold = 8
 
-// UpsertHost records a host seen during a scan. Returns the host id and
-// whether this is the first time the host has ever been seen.
-func (s *Store) UpsertHost(subnetID int64, ip, mac, hostname string) (id int64, isNew bool, err error) {
+// UpsertHost records a host seen during a scan. mac/hostname/vendor are only
+// applied when non-empty, so a later call with less information (e.g. a
+// plain TCP probe after netdiscover already supplied a vendor) never clobbers
+// what's already known. Returns the host id and whether this is the first
+// time the host has ever been seen.
+func (s *Store) UpsertHost(subnetID int64, ip, mac, hostname, vendor string) (id int64, isNew bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -35,6 +38,10 @@ func (s *Store) UpsertHost(subnetID int64, ip, mac, hostname string) (id int64, 
 			set += ", hostname = ?"
 			args = append(args, hostname)
 		}
+		if vendor != "" {
+			set += ", vendor = ?"
+			args = append(args, vendor)
+		}
 		args = append(args, id)
 		_, err = s.db.Exec(`UPDATE hosts SET `+set+` WHERE id = ?`, args...)
 		return id, false, err
@@ -43,8 +50,8 @@ func (s *Store) UpsertHost(subnetID int64, ip, mac, hostname string) (id int64, 
 		return 0, false, err
 	}
 
-	res, err := s.db.Exec(`INSERT INTO hosts (subnet_id, ip, mac, hostname, status, source, first_seen, last_seen, miss_count)
-		VALUES (?, ?, ?, ?, 'up', 'auto', ?, ?, 0)`, subnetID, ip, mac, hostname, now, now)
+	res, err := s.db.Exec(`INSERT INTO hosts (subnet_id, ip, mac, hostname, vendor, status, source, first_seen, last_seen, miss_count)
+		VALUES (?, ?, ?, ?, ?, 'up', 'auto', ?, ?, 0)`, subnetID, ip, mac, hostname, vendor, now, now)
 	if err != nil {
 		return 0, false, err
 	}

@@ -21,6 +21,7 @@ import (
 	"network-enumerator/internal/discovery"
 	"network-enumerator/internal/model"
 	"network-enumerator/internal/store"
+	"network-enumerator/internal/version"
 	"network-enumerator/web"
 )
 
@@ -131,12 +132,18 @@ func (w *statusWriter) WriteHeader(status int) {
 // printStartupBanner logs the effective configuration and, if the account
 // still has the out-of-the-box credentials, a reminder to change them.
 func printStartupBanner(addr, dbPath string, cfg discovery.Config, usingDefaultCreds bool) {
+	log.Printf("network-enumerator %s (built %s)", version.Version, version.BuildDate)
 	log.Printf("network-enumerator starting — listen %s, scan interval %s, host concurrency %d, port concurrency %d, miss threshold %d, auto-discover local subnets %t",
 		addr, cfg.Interval, cfg.HostConcurrency, cfg.PortConcurrency, cfg.MissThreshold, cfg.AutoDiscoverLocal)
 	if nmapPath, ok := discovery.NmapPath(); ok {
 		log.Printf("nmap found at %s — used for scanning when the scan method is set to auto or nmap", nmapPath)
 	} else {
 		log.Printf("nmap not found on PATH — using built-in TCP/ICMP scanning (install nmap and it'll be used automatically)")
+	}
+	if netdiscoverPath, ok := discovery.NetdiscoverPath(); ok {
+		log.Printf("netdiscover found at %s — used for ARP-based discovery on locally-attached subnets (disable in Settings if not wanted)", netdiscoverPath)
+	} else {
+		log.Printf("netdiscover not found on PATH — skipping ARP-based discovery (install netdiscover and it'll be used automatically)")
 	}
 	if dbPath != "" {
 		log.Printf("persisting data to %s", dbPath)

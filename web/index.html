@@ -21,6 +21,7 @@
     <input id="loginPassword" type="password" autocomplete="current-password" required>
     <p id="loginError" class="error small" hidden></p>
     <button type="submit" class="btn btn-primary">Sign in</button>
+    <p id="loginVersionInfo" class="muted small login-version"></p>
   </form>
 </div>
 
@@ -57,6 +58,7 @@
           <button id="btnDeepScanAll" class="account-menu-item" title="Scan every TCP port (1-65535) on every host — much slower than a normal scan">Deep scan (all ports)…</button>
         </div>
       </div>
+      <button id="btnViewToggle" class="btn" title="Switch between the animated graph and a static expand/collapse tree — same segments-and-hosts view, no canvas animation, easier on remote sessions with poor video acceleration" aria-pressed="false">Simple view</button>
       <button id="btnAddSubnet" class="btn">+ Subnet</button>
       <button id="btnAddHost" class="btn">+ Host</button>
       <button id="btnTags" class="btn">Tags</button>
@@ -82,9 +84,10 @@
     </div>
   </header>
 
-  <main class="layout">
+  <main class="layout" id="layout">
     <section class="graph-pane">
       <canvas id="graph"></canvas>
+      <canvas id="simpleGraph"></canvas>
       <div class="graph-overlay">
         <div class="legend">
           <div class="legend-row"><span class="swatch status-good"></span>up</div>
@@ -95,7 +98,7 @@
         </div>
         <button id="btnCollapseAll" type="button" class="btn btn-small graph-collapse-btn">Collapse all</button>
       </div>
-      <div class="graph-hint muted small">scroll to zoom · drag to pan · drag a node to pin it · click a host for details · click a dashed square to expand a large subnet</div>
+      <div class="graph-hint muted small">scroll to zoom · drag to pan · drag a node to move it · click a host for details · click a dashed square to expand a large subnet</div>
       <div id="emptyState" class="empty-state" hidden>
         <p>No hosts discovered yet.</p>
         <p class="muted small">The scanner runs automatically. You can also add a subnet or host manually, or trigger a scan now.</p>
@@ -180,6 +183,10 @@
               <option value="tcp">Built-in (TCP connect + ICMP ping)</option>
             </select>
             <p id="stScanMethodError" class="error small" hidden></p>
+
+            <label class="checkbox-inline"><input type="checkbox" id="stNetdiscoverEnabled"> Use netdiscover for ARP-based discovery</label>
+            <p class="muted small">Finds hosts on locally-attached subnets that filter ICMP/TCP but still answer ARP, and looks up MAC vendors. Has no effect on routed or manually-added subnets. <span id="stNetdiscoverStatus"></span></p>
+            <p id="stNetdiscoverError" class="error small" hidden></p>
           </section>
 
           <section class="settings-section">
@@ -197,6 +204,8 @@
               <button id="stClearHosts" class="btn btn-danger btn-small" disabled>Clear all hosts</button>
             </div>
           </section>
+
+          <p id="stVersionInfo" class="muted small settings-version"></p>
         </div>
       </div>
     </aside>

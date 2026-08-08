@@ -34,3 +34,33 @@ func (s *Store) SetScanMethod(method string) error {
 		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, method)
 	return err
 }
+
+// GetNetdiscoverEnabled reports whether ARP-based discovery via netdiscover
+// should be used when the binary is available, defaulting to true (the same
+// "use it automatically if it's there" default nmap gets under
+// ScanMethodAuto) when nothing has been set yet.
+func (s *Store) GetNetdiscoverEnabled() (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var v string
+	err := s.db.QueryRow(`SELECT value FROM settings WHERE key = 'netdiscover_enabled'`).Scan(&v)
+	if err == sql.ErrNoRows {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return v == "true", nil
+}
+
+func (s *Store) SetNetdiscoverEnabled(enabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v := "false"
+	if enabled {
+		v = "true"
+	}
+	_, err := s.db.Exec(`INSERT INTO settings (key, value) VALUES ('netdiscover_enabled', ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`, v)
+	return err
+}
