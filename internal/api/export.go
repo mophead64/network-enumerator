@@ -27,6 +27,7 @@ type exportHost struct {
 	SegmentID          string `json:"segment_id"`
 	Hostname           string `json:"hostname,omitempty"`
 	IP                 string `json:"ip"`
+	MAC                string `json:"mac,omitempty"`
 	ManagementIP       string `json:"management_ip,omitempty"`
 	DeviceType         string `json:"device_type,omitempty"`
 	Criticality        string `json:"criticality,omitempty"`
@@ -59,10 +60,12 @@ func segmentExportID(subnetID int64) string { return fmt.Sprintf("seg-%d", subne
 func hostExportID(hostID int64) string      { return fmt.Sprintf("host-%d", hostID) }
 
 // exportNetworkMap produces a JSON document of the currently-discovered
-// network in the segments/hosts/ports schema used by external tooling.
-// Fields this app doesn't track (device_type, criticality, model, os, role,
-// owner, verification_status, segment vlan/description) are left empty
-// rather than guessed.
+// network in the segments/hosts/ports schema used by external tooling. Only
+// fields this app's automated scanning (ARP/netdiscover/nmap) actually
+// populates are included; fields that would require a user to hand-curate
+// data in-app just for this export (device_type, criticality, model, os,
+// role, owner, verification_status, segment vlan/description) are left
+// empty rather than guessed or turned into a manual-entry feature.
 func (s *Server) exportNetworkMap(w http.ResponseWriter, r *http.Request) {
 	subnets, err := s.st.ListSubnets()
 	if err != nil {
@@ -95,6 +98,7 @@ func (s *Server) exportNetworkMap(w http.ResponseWriter, r *http.Request) {
 			SegmentID:    segmentExportID(h.SubnetID),
 			Hostname:     h.Hostname,
 			IP:           h.IP,
+			MAC:          h.MAC,
 			ManagementIP: h.IP,
 			Vendor:       h.Vendor,
 			Notes:        h.Notes,
