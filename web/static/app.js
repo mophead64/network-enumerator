@@ -1964,6 +1964,80 @@ function downloadPriorityReport(format) {
   }
 }
 
+/** Mermaid label text can't contain a literal double quote or newline —
+ * #quot; is Mermaid's own HTML-entity escape for a literal quote inside a
+ * quoted label, and a run of newlines is flattened to a single space since
+ * multi-line labels use <br/> instead (see mermaidHostLabel). */
+function mermaidEscape(s) {
+  return String(s ?? "").replace(/"/g, "#quot;").replace(/[\r\n]+/g, " ").trim();
+}
+
+function mermaidStatusClass(status) {
+  if (status === "down") return "statusDown";
+  if (status === "unknown") return "statusUnknown";
+  return "statusUp";
+}
+
+/** One host node's label: IP, then hostname and open ports each on their
+ * own line (via <br/>) when present, prefixed with a warning marker for an
+ * unacknowledged priority host — the same "priority" definition
+ * priorityReportHosts uses. */
+function mermaidHostLabel(h) {
+  const lines = [h.ip];
+  if (h.hostname) lines.push(h.hostname);
+  const openPorts = (h.ports || []).filter((p) => p.state === "open").map((p) => p.port).sort((a, b) => a - b);
+  if (openPorts.length) lines.push(openPorts.join(", "));
+  const prefix = h.riskLevel && !h.acknowledged ? "⚠ " : "";
+  return prefix + lines.map(mermaidEscape).join("<br/>");
+}
+
+/** Builds a Mermaid flowchart — subnets as subgraphs, hosts as nodes inside
+ * them, color-coded by status — for "Diagram (Mermaid, for draw.io)".
+ * draw.io can turn this into an editable diagram via Extras > Edit Diagram,
+ * pasting this text with the diagram type set to Mermaid. Kept to plain
+ * flowchart/subgraph/classDef syntax (no newer Mermaid features) since
+ * draw.io's Mermaid support lags the full mermaid.js feature set. */
+function buildMermaidDiagram(subnets, hosts) {
+  const bySubnet = new Map();
+  for (const h of hosts) {
+    if (!bySubnet.has(h.subnetId)) bySubnet.set(h.subnetId, []);
+    bySubnet.get(h.subnetId).push(h);
+  }
+
+  const lines = [
+    "flowchart LR",
+    "classDef statusUp fill:#0ca30c,stroke:#087a08,color:#fff;",
+    "classDef statusDown fill:#d03b3b,stroke:#9c2323,color:#fff;",
+    "classDef statusUnknown fill:#898781,stroke:#5f5d59,color:#fff;",
+  ];
+
+  for (const sn of subnets) {
+    const snHosts = (bySubnet.get(sn.id) || []).slice().sort((a, b) => a.ip.localeCompare(b.ip, undefined, { numeric: true }));
+    lines.push(`  subgraph seg${sn.id}["${mermaidEscape(subnetDisplayLabel(sn))}"]`);
+    if (snHosts.length === 0) {
+      lines.push(`    seg${sn.id}empty["no hosts"]`);
+    } else {
+      for (const h of snHosts) {
+        lines.push(`    host${h.id}["${mermaidHostLabel(h)}"]:::${mermaidStatusClass(h.status)}`);
+      }
+    }
+    lines.push("  end");
+  }
+
+  return lines.join("\n");
+}
+
+/** Downloads the Mermaid diagram for every non-hidden subnet/host — the
+ * same "what's actually in scope" default visibleHosts()/priorityReportHosts
+ * use elsewhere, so a hidden management subnet doesn't clutter a diagram
+ * meant for sharing outside the app. */
+function downloadMermaidDiagram() {
+  const subnets = state.subnets.filter((sn) => !sn.hidden);
+  const subnetIds = new Set(subnets.map((sn) => sn.id));
+  const hosts = state.hosts.filter((h) => subnetIds.has(h.subnetId));
+  downloadBlob(new Blob([buildMermaidDiagram(subnets, hosts)], { type: "text/plain" }), `network-map-${exportTimestamp()}.mmd`);
+}
+
 /** "Export ▾" mirrors the "Import ▾" menu right next to it:
  *  - Export (filtered): only the hosts matching the current search/status/
  *    tag/risk/etc. filters (see filteredHosts) and hidden-subnet setting —
@@ -1972,7 +2046,8 @@ function downloadPriorityReport(format) {
  *    any UI filter, via the same download the button used to be.
  *  - Reports (HTML/CSV): a human-readable report of every priority-flagged
  *    host and its findings, for handing to someone who isn't going to load
- *    the network map JSON back into this app. */
+ *    the network map JSON back into this app.
+ *  - Diagrams (Mermaid): a draw.io-importable flowchart of subnets/hosts. */
 function wireExport() {
   const exportMenu = registerDropdownPanel(qs("#exportMenu"));
   qs("#btnExportMenuToggle").addEventListener("click", (e) => {
@@ -1999,6 +2074,10 @@ function wireExport() {
   qs("#btnReportPriorityCsv").addEventListener("click", () => {
     exportMenu.hidden = true;
     downloadPriorityReport("csv");
+  });
+  qs("#btnExportMermaid").addEventListener("click", () => {
+    exportMenu.hidden = true;
+    downloadMermaidDiagram();
   });
 }
 
