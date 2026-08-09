@@ -769,7 +769,7 @@ class Graph {
           ctx.fillStyle = node.count ? muted : warning;
           ctx.font = `${11 / this.transform.k}px system-ui, sans-serif`;
           ctx.textAlign = "center";
-          const label = node.data ? `${node.data.cidr} (${node.count || 0})` : "";
+          const label = node.data ? subnetGraphLabel(node.data, node.count) : "";
           ctx.fillText(label, node.x, node.y - node.r - 6 / this.transform.k);
         }
         continue;
@@ -912,6 +912,20 @@ function graphSubnets() {
   let subnets = state.filters.showHiddenSubnets ? state.subnets : state.subnets.filter((sn) => !sn.hidden);
   if (state.filters.subnetId) subnets = subnets.filter((sn) => String(sn.id) === String(state.filters.subnetId));
   return subnets;
+}
+
+/** Graph label for a subnet node: its name (if set) prefixed onto the CIDR,
+ * followed by its host count — see Graph._draw's subnet branch. */
+function subnetGraphLabel(sn, count) {
+  const prefix = sn.name ? `${sn.name} — ` : "";
+  return `${prefix}${sn.cidr} (${count || 0})`;
+}
+
+/** Host modal's "Subnet" field: name plus CIDR if the subnet has one, just
+ * the CIDR otherwise — see openHostModal. */
+function subnetDisplayLabel(sn) {
+  if (!sn) return "—";
+  return sn.name ? `${sn.name} (${sn.cidr})` : sn.cidr;
 }
 
 /** "unknown" hosts were found only via a dig -x PTR record — no ping/TCP/ARP
@@ -1205,6 +1219,7 @@ function openHostModal(hostId) {
   qs("#hmStatus").appendChild(el("span", { class: "pill " + statusPillClass(h.status), title: h.status === "unknown" ? unconfirmedTitle : "" }, [
     el("span", { class: "dot" }), h.status,
   ]));
+  qs("#hmSubnet").textContent = subnetDisplayLabel(subnetById(h.subnetId));
   qs("#hmHostnameInput").value = h.hostname || "";
   qs("#hmMacInput").value = h.mac || "";
   qs("#hmSource").textContent = h.source;
