@@ -53,6 +53,13 @@ func (s *Server) me(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"username": username})
 }
 
+// activeSessions reports how many sessions are currently signed in — the
+// topbar's "active users" count. Authenticated like everything else, so
+// only someone already signed in can see how many others are too.
+func (s *Server) activeSessions(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]int{"count": s.sessions.Count()})
+}
+
 func (s *Server) changePassword(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		CurrentPassword string `json:"currentPassword"`

@@ -59,6 +59,28 @@ func (s *SessionStore) Valid(token string) bool {
 	return true
 }
 
+// Count returns the number of currently live sessions — how many browser
+// tabs/devices are signed in right now, shown as the "active users" count in
+// the UI. Since this app has a single admin account, that's really a count
+// of concurrent sessions rather than distinct users, but with one account
+// the two coincide closely enough to be the useful number to show. Also
+// opportunistically drops expired entries it comes across, the same
+// lazy-cleanup Valid() already does on every auth check.
+func (s *SessionStore) Count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	n := 0
+	for token, exp := range s.sessions {
+		if now.After(exp) {
+			delete(s.sessions, token)
+			continue
+		}
+		n++
+	}
+	return n
+}
+
 // Revoke invalidates a session token, e.g. on logout.
 func (s *SessionStore) Revoke(token string) {
 	s.mu.Lock()

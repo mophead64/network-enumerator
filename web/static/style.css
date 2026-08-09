@@ -153,6 +153,11 @@ button, input, select, textarea { font: inherit; color: inherit; }
   background: none; border: none; cursor: pointer; font-size: 13px; color: var(--text-primary);
 }
 .account-menu-item:hover { background: var(--surface-3); }
+.account-menu-divider { height: 1px; background: var(--border); margin: 4px 2px; }
+.account-menu-label {
+  padding: 6px 10px 2px; font-size: 11px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .04em; color: var(--text-muted);
+}
 
 .pill {
   display: inline-flex; align-items: center; gap: 6px;
@@ -216,6 +221,23 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .swatch-bucket { background: none; border: 2px dashed var(--series-1); border-radius: 3px; }
 
 .graph-hint { position: absolute; bottom: 10px; left: 12px; }
+
+.zoom-controls {
+  position: absolute; bottom: 12px; right: 12px;
+  display: flex; flex-direction: column;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.zoom-controls button {
+  width: 30px; height: 30px;
+  display: flex; align-items: center; justify-content: center;
+  background: none; border: none; cursor: pointer;
+  color: var(--text-primary); font-size: 16px; font-weight: 600; line-height: 1;
+}
+.zoom-controls button:hover { background: var(--surface-3); }
+.zoom-controls button + button { border-top: 1px solid var(--border); }
 
 .empty-state {
   position: absolute; inset: 0;
@@ -354,11 +376,13 @@ button, input, select, textarea { font: inherit; color: inherit; }
 
 .hm-meta { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .hm-section h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); margin: 0 0 6px; }
+.hm-meta input::placeholder { font-size: 12px; color: var(--text-muted); }
 
 .field-label { font-size: 12px; color: var(--text-muted); margin-top: 4px; }
 input[type=text], input[type=search], input:not([type]), select, textarea {
   width: 100%; padding: 7px 9px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-2);
 }
+input:disabled { background: var(--surface-3); color: var(--text-muted); cursor: not-allowed; }
 textarea { resize: vertical; }
 .error { color: var(--status-critical); }
 .hint {
@@ -389,17 +413,39 @@ textarea { resize: vertical; }
 /* Custom tooltip instead of the native title attribute: title's browser
  * default hover delay (and cursor-anchored position) is what "doesn't
  * immediately show" and "should be to the right" were about. No transition
- * here is deliberate — it must appear the instant the icon is hovered. */
-.hm-ack-info::after {
+ * here is deliberate — it must appear the instant the element is hovered.
+ * Any element can opt in by setting a data-tooltip attribute. */
+[data-tooltip] { position: relative; }
+[data-tooltip]::after {
   content: attr(data-tooltip);
   position: absolute; left: calc(100% + 8px); top: 50%; transform: translateY(-50%);
   width: 230px; padding: 7px 9px; border-radius: 7px;
   background: var(--surface-1); color: var(--text-secondary);
   border: 1px solid var(--border); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
   font-size: 11.5px; font-weight: 400; line-height: 1.4; text-align: left;
+  white-space: pre-line;
   z-index: 70; opacity: 0; visibility: hidden; pointer-events: none;
 }
-.hm-ack-info:hover::after, .hm-ack-info:focus-visible::after { opacity: 1; visibility: visible; }
+[data-tooltip]:hover::after, [data-tooltip]:focus-visible::after { opacity: 1; visibility: visible; }
+
+/* Tools pill's breakdown is a real hover panel rather than a data-tooltip
+ * pseudo-element: its content is rebuilt by JS on every status refresh
+ * (see renderToolStatus), which replaces the pill's whole className —
+ * a class living on the pill itself would get silently wiped every time. */
+.tool-status-wrap { position: relative; }
+.tool-status-panel {
+  position: absolute; left: 50%; top: calc(100% + 8px); transform: translateX(-50%);
+  width: max-content; max-width: 300px; padding: 7px 9px; border-radius: 7px;
+  background: var(--surface-1); color: var(--text-secondary);
+  border: 1px solid var(--border); box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+  font-size: 11.5px; font-weight: 400; line-height: 1.5; text-align: left;
+  z-index: 70; opacity: 0; visibility: hidden; pointer-events: none;
+}
+.tool-status-wrap:hover .tool-status-panel, .tool-status-wrap:focus-within .tool-status-panel { opacity: 1; visibility: visible; }
+.tool-status-row { display: flex; gap: 5px; }
+.tool-status-mark { flex: 0 0 auto; font-weight: 700; }
+.tool-status-mark.tool-status-ok { color: var(--status-good); }
+.tool-status-mark.tool-status-bad { color: var(--status-critical); }
 .badge-acked {
   font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 999px; margin-left: 6px;
   background: var(--surface-3); color: var(--text-muted); border: 1px solid var(--text-muted);
@@ -501,6 +547,11 @@ textarea { resize: vertical; }
   border-color: color-mix(in srgb, var(--series-1) 45%, transparent);
 }
 .badge-suspect {
+  font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 999px;
+  background: var(--surface-3); color: var(--text-muted); border: 1px dashed var(--text-muted);
+  white-space: nowrap;
+}
+.badge-unconfirmed {
   font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 999px;
   background: var(--surface-3); color: var(--text-muted); border: 1px dashed var(--text-muted);
   white-space: nowrap;

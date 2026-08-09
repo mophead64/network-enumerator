@@ -145,6 +145,11 @@ func printStartupBanner(addr, dbPath string, cfg discovery.Config, usingDefaultC
 	} else {
 		log.Printf("netdiscover not found on PATH — skipping ARP-based discovery (install netdiscover and it'll be used automatically)")
 	}
+	if dnsreconPath, ok := discovery.DnsreconPath(); ok {
+		log.Printf("dnsrecon found at %s — used to reverse-DNS-sweep a whole subnet in one pass for hosts that don't answer ping/TCP/ARP", dnsreconPath)
+	} else {
+		log.Printf("dnsrecon not found on PATH — falling back to a slower per-address `dig -x` sweep for hosts that don't answer ping/TCP/ARP (if dig is installed)")
+	}
 	if dbPath != "" {
 		log.Printf("persisting data to %s", dbPath)
 	} else {

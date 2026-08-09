@@ -149,16 +149,18 @@ const Api = {
   me: () => Api._req("GET", "/api/auth/me"),
   changePassword: (currentPassword, newUsername, newPassword) =>
     Api._req("POST", "/api/auth/change-password", { currentPassword, newUsername, newPassword }),
+  activeSessions: () => Api._req("GET", "/api/auth/sessions"),
 
   subnets: () => Api._req("GET", "/api/subnets"),
   addSubnet: (cidr, name) => Api._req("POST", "/api/subnets", { cidr, name }),
+  renameSubnet: (id, name) => Api._req("PATCH", `/api/subnets/${id}`, { name }),
   setSubnetHidden: (id, hidden) => Api._req("PATCH", `/api/subnets/${id}`, { hidden }),
   setSubnetEnabled: (id, enabled) => Api._req("PATCH", `/api/subnets/${id}`, { enabled }),
   deleteSubnet: (id) => Api._req("DELETE", `/api/subnets/${id}`),
 
   hosts: () => Api._req("GET", "/api/hosts"),
   addHost: (subnetId, ip, hostname, notes) => Api._req("POST", "/api/hosts", { subnetId, ip, hostname, notes }),
-  updateHostNotes: (id, notes) => Api._req("PATCH", `/api/hosts/${id}`, { notes }),
+  updateHost: (id, fields) => Api._req("PATCH", `/api/hosts/${id}`, fields),
   deleteHost: (id) => Api._req("DELETE", `/api/hosts/${id}`),
   clearAllHosts: (confirm) => Api._req("DELETE", `/api/hosts?confirm=${encodeURIComponent(confirm)}`),
   addHostTag: (hostId, tagId) => Api._req("POST", `/api/hosts/${hostId}/tags`, { tagId }),
@@ -184,9 +186,15 @@ const Api = {
   updateSettings: (scanMethod) => Api._req("PATCH", "/api/settings", { scanMethod }),
   updateNetdiscoverEnabled: (netdiscoverEnabled) => Api._req("PATCH", "/api/settings", { netdiscoverEnabled }),
 
+  importNetworkMap: (doc) => Api._req("POST", "/api/import/network-map", doc),
+  importDnsRecon: (records) => Api._req("POST", "/api/import/dnsrecon", records),
+
   events: () => Api._req("GET", "/api/events"),
-  scanNow: () => Api._req("POST", "/api/scan"),
+  toolStatus: () => Api._req("GET", "/api/tools/status"),
+  quickScanAll: () => Api._req("POST", "/api/scan/quick"),
+  massScanAll: () => Api._req("POST", "/api/scan/mass"),
   deepScanAll: () => Api._req("POST", "/api/scan/deep"),
+  reverseDnsScanAll: () => Api._req("POST", "/api/scan/reverse-dns"),
   scanStatus: () => Api._req("GET", "/api/scan/status"),
 };
 
@@ -235,6 +243,9 @@ function tagById(id) { return state.tags.find((t) => t.id === id); }
 const TAG_PALETTE = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"];
 
 class Graph {
+  static ZOOM_MIN = 0.15;
+  static ZOOM_MAX = 4;
+
   /** animated (default true) picks the physics-simulated layout used by
    * the main graph view. Passing false gives the simple-view graph: same
    * node/link model, same pan/zoom/drag/click-to-expand interactions, but
@@ -341,13 +352,33 @@ class Graph {
   _onWheel(e) {
     e.preventDefault();
     const rect = this.canvas.getBoundingClientRect();
-    const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+    this._zoomAt(e.clientX - rect.left, e.clientY - rect.top, Math.exp(-e.deltaY * 0.001));
+  }
+
+  /** Zooms by factor around the screen point (sx, sy) so that point stays
+   * under the cursor — shared by scroll-to-zoom (_onWheel, screen point =
+   * cursor) and the +/- zoom buttons (zoomBy, screen point = canvas center,
+   * for users who'd rather click than scroll/pinch). */
+  _zoomAt(sx, sy, factor) {
     const before = this.screenToWorld(sx, sy);
-    const factor = Math.exp(-e.deltaY * 0.001);
-    this.transform.k = Math.min(4, Math.max(0.15, this.transform.k * factor));
+    this.transform.k = Math.min(Graph.ZOOM_MAX, Math.max(Graph.ZOOM_MIN, this.transform.k * factor));
     const after = this.screenToWorld(sx, sy);
     this.transform.x += (after.x - before.x) * this.transform.k;
     this.transform.y += (after.y - before.y) * this.transform.k;
+    this.wake();
+  }
+
+  /** Zooms in (factor > 1) or out (factor < 1) centered on the canvas —
+   * the +/- zoom buttons' handler. */
+  zoomBy(factor) {
+    this._zoomAt(this.width / 2, this.height / 2, factor);
+  }
+
+  /** Restores the default 1:1 zoom, centered — the "reset zoom" button. */
+  resetZoom() {
+    this.transform.x = this.width / 2;
+    this.transform.y = this.height / 2;
+    this.transform.k = 1;
     this.wake();
   }
 
@@ -735,7 +766,7 @@ class Graph {
         ctx.textBaseline = "alphabetic";
         ctx.restore();
         if (this.transform.k > 0.35) {
-          ctx.fillStyle = muted;
+          ctx.fillStyle = node.count ? muted : warning;
           ctx.font = `${11 / this.transform.k}px system-ui, sans-serif`;
           ctx.textAlign = "center";
           const label = node.data ? `${node.data.cidr} (${node.count || 0})` : "";
@@ -771,11 +802,17 @@ class Graph {
       }
 
       const h = node.data;
-      const color = !h ? muted : h.status === "down" ? critical : good;
+      let color = muted;
+      let alpha = 1;
+      if (h) {
+        if (h.status === "down") { color = critical; alpha = 0.55; }
+        else if (h.status === "unknown") { color = muted; alpha = 0.75; }
+        else { color = good; }
+      }
       ctx.beginPath();
       ctx.arc(node.x, node.y, node.r, 0, Math.PI * 2);
       ctx.fillStyle = color;
-      ctx.globalAlpha = h && h.status === "down" ? 0.55 : 1;
+      ctx.globalAlpha = alpha;
       ctx.fill();
       ctx.globalAlpha = 1;
 
@@ -877,6 +914,21 @@ function graphSubnets() {
   return subnets;
 }
 
+/** "unknown" hosts were found only via a dig -x PTR record — no ping/TCP/ARP
+ * response and no confirmed open port yet — so they're neither up (green)
+ * nor down (red), just unconfirmed (muted). */
+function statusColorVar(status) {
+  if (status === "down") return "var(--status-critical)";
+  if (status === "unknown") return "var(--text-muted)";
+  return "var(--status-good)";
+}
+
+function statusPillClass(status) {
+  if (status === "down") return "pill-bad";
+  if (status === "unknown") return "pill-muted";
+  return "pill-good";
+}
+
 const RISK_LABEL = { critical: "CRITICAL", warning: "WARNING", info: "INFO" };
 
 function riskBadge(level, reasons, acknowledged) {
@@ -919,7 +971,7 @@ function renderHostList() {
     const sn = subnetById(h.subnetId);
     const openPortCount = (h.ports || []).filter((p) => p.state === "open").length;
     const row = el("div", { class: "host-row", onclick: () => openHostModal(h.id) }, [
-      el("span", { class: "status-dot", style: `background:${h.status === "down" ? "var(--status-critical)" : "var(--status-good)"}` }),
+      el("span", { class: "status-dot", style: `background:${statusColorVar(h.status)}` }),
       el("div", { class: "host-main" }, [
         el("div", { class: "host-ip" }, [h.ip + (h.hostname ? "  " : ""), h.hostname ? el("span", { class: "muted", text: h.hostname }) : null]),
         el("div", { class: "host-sub" }, [sn ? sn.cidr : "", openPortCount ? ` · ${openPortCount} open port${openPortCount === 1 ? "" : "s"}` : ""]),
@@ -927,6 +979,7 @@ function renderHostList() {
       ...(h.tags || []).slice(0, 3).map((t) => el("span", { class: "tag-dot", style: `background:${t.color}`, title: t.name })),
       h.riskLevel ? riskBadge(h.riskLevel, h.riskReasons, h.acknowledged) : null,
       h.suspect ? el("span", { class: "badge-suspect", title: h.suspectReason, text: "SUSPECT" }) : null,
+      h.status === "unknown" ? el("span", { class: "badge-unconfirmed", title: "Found via reverse DNS only — not yet confirmed by ping/TCP/ARP or an open port", text: "UNCONFIRMED" }) : null,
       h.isNew ? el("span", { class: "badge-new", text: "NEW" }) : null,
     ]);
     list.appendChild(row);
@@ -1011,6 +1064,7 @@ function renderSubnetList() {
             class: "btn-icon", title: sn.hidden ? "Unhide subnet — show its hosts again" : "Hide subnet — suppress its hosts from the list, graph, and counts",
             onclick: async () => { await Api.setSubnetHidden(sn.id, !sn.hidden); await refreshSubnets(); },
           }, [sn.hidden ? "👁" : "🙈"]),
+          el("button", { class: "btn-icon", title: "Rename subnet", onclick: () => openSubnetModal(sn) }, ["✎"]),
           el("button", { class: "btn-icon", title: "Remove subnet", onclick: () => removeSubnet(sn.id) }, ["✕"]),
         ]),
       ]),
@@ -1146,12 +1200,13 @@ function openHostModal(hostId) {
     }
   }
 
+  const unconfirmedTitle = "Found via reverse DNS only — no ping/TCP/ARP response yet, and no open port has confirmed it up";
   qs("#hmStatus").innerHTML = "";
-  qs("#hmStatus").appendChild(el("span", { class: "pill " + (h.status === "down" ? "pill-bad" : "pill-good") }, [
+  qs("#hmStatus").appendChild(el("span", { class: "pill " + statusPillClass(h.status), title: h.status === "unknown" ? unconfirmedTitle : "" }, [
     el("span", { class: "dot" }), h.status,
   ]));
-  qs("#hmHostname").textContent = h.hostname || "—";
-  qs("#hmMac").textContent = h.mac || "—";
+  qs("#hmHostnameInput").value = h.hostname || "";
+  qs("#hmMacInput").value = h.mac || "";
   qs("#hmSource").textContent = h.source;
   qs("#hmFirstSeen").textContent = timeAgo(h.firstSeen);
   qs("#hmLastSeen").textContent = timeAgo(h.lastSeen);
@@ -1188,6 +1243,8 @@ function openHostModal(hostId) {
   }
 
   qs("#hmNotes").oninput = markUnsaved;
+  qs("#hmHostnameInput").oninput = markUnsaved;
+  qs("#hmMacInput").oninput = markUnsaved;
 
   const deepScanBtn = qs("#hmDeepScan");
   deepScanBtn.disabled = false;
@@ -1206,7 +1263,19 @@ function openHostModal(hostId) {
   };
 
   qs("#hmSave").onclick = async () => {
-    await Api.updateHostNotes(h.id, qs("#hmNotes").value);
+    // hostname/mac are only sent when actually edited, not on every save —
+    // avoids an unnecessary PATCH when they're untouched.
+    const fields = { notes: qs("#hmNotes").value };
+    const hostnameVal = qs("#hmHostnameInput").value.trim();
+    if (hostnameVal !== (h.hostname || "")) fields.hostname = hostnameVal;
+    const macVal = qs("#hmMacInput").value.trim();
+    if (macVal !== (h.mac || "")) fields.mac = macVal;
+    try {
+      await Api.updateHost(h.id, fields);
+    } catch (err) {
+      toast(err.message, "bad");
+      return;
+    }
     for (const tagId of state.pendingTagRemoves) await Api.removeHostTag(h.id, tagId);
     for (const tagId of state.pendingTagAdds) await Api.addHostTag(h.id, tagId);
     state.pendingTagAdds = [];
@@ -1333,29 +1402,42 @@ async function refreshTags() {
   state.tags = await Api.tags();
 }
 
-const refreshDebounced = debounce(async () => {
+async function refreshHostsAndSubnets() {
   const [hosts, subnets] = await Promise.all([Api.hosts(), Api.subnets()]);
   state.hosts = hosts;
   state.subnets = subnets;
   renderAll();
-}, 350);
+}
+
+const refreshDebounced = debounce(refreshHostsAndSubnets, 350);
 
 /* ---------------------------------------------------------------------- */
 /* SSE                                                                    */
 /* ---------------------------------------------------------------------- */
 
+// sse/scanPollTimer are module-level (rather than local to connectSSE/
+// startLiveUpdates) so stopLiveUpdates() can tear them down from anywhere —
+// notably showLoginScreen(), so a session going stale (expiry, logout, or
+// the in-memory session store losing everything on a server restart)
+// actually stops hitting the server instead of the EventSource's built-in
+// reconnect and the 4s scan-status poll both hammering it with 401s forever
+// in the background with no visible sign to the user.
+let sse = null;
+let scanPollTimer = null;
+let sessionsPollTimer = null;
+
 function connectSSE() {
   const connLabel = qs("#connLabel"), connState = qs("#connState");
-  const es = new EventSource("/api/events/stream");
+  sse = new EventSource("/api/events/stream");
 
-  es.addEventListener("ready", () => {
+  sse.addEventListener("ready", () => {
     connLabel.textContent = "live";
     connState.className = "pill pill-good";
   });
 
   const evTypes = ["new_subnet", "new_host", "new_port", "host_down", "port_closed", "scan_anomaly", "hosts_cleared", "priority_reflag", "deep_scan_started", "deep_scan_finished"];
   for (const type of evTypes) {
-    es.addEventListener(type, (e) => {
+    sse.addEventListener(type, (e) => {
       const ev = JSON.parse(e.data);
       receiveNotification(ev);
       renderCounts();
@@ -1372,10 +1454,51 @@ function connectSSE() {
     });
   }
 
-  es.onerror = () => {
+  sse.onerror = () => {
     connLabel.textContent = "reconnecting…";
     connState.className = "pill pill-bad";
   };
+}
+
+/** Starts the SSE connection and the 4s scan-status poll if they aren't
+ * already running — called once on first login and again on every re-login
+ * after stopLiveUpdates() tore them down. Idempotent so it's safe to call
+ * from both startApp() paths without risking a duplicate interval/
+ * connection. */
+function startLiveUpdates() {
+  if (scanPollTimer) return;
+  connectSSE();
+  pollScanStatus();
+  scanPollTimer = setInterval(pollScanStatus, 4000);
+  pollActiveSessions();
+  sessionsPollTimer = setInterval(pollActiveSessions, 15000); // changes rarely, no need for the 4s cadence
+}
+
+/** Tears down the SSE connection and scan-status/active-sessions polls —
+ * see the comment on sse/scanPollTimer above for why. Safe to call even if
+ * nothing is running (e.g. the very first, pre-login showLoginScreen()
+ * call). */
+function stopLiveUpdates() {
+  if (scanPollTimer) {
+    clearInterval(scanPollTimer);
+    scanPollTimer = null;
+  }
+  if (sessionsPollTimer) {
+    clearInterval(sessionsPollTimer);
+    sessionsPollTimer = null;
+  }
+  if (sse) {
+    sse.close();
+    sse = null;
+  }
+}
+
+async function pollActiveSessions() {
+  try {
+    const { count } = await Api.activeSessions();
+    qs("#activeUsersCount").textContent = count;
+    qs("#activeUsers").title = count === 1 ? "1 user currently signed in" : `${count} users currently signed in`;
+  } catch (_) { /* transient */ }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1391,6 +1514,16 @@ async function pollScanStatus() {
   } catch (_) { /* transient */ }
 }
 
+// Mirrors discovery.ScanMode's values ("" = the regular automatic/system-
+// triggered cycle, otherwise one of the manually forced techniques).
+const SCAN_MODE_LABEL = {
+  "": "scanning…",
+  quick: "quick scanning…",
+  mass: "mass scanning…",
+  deep: "deep scanning…",
+  dns: "reverse DNS scanning…",
+};
+
 /** Renders from the cached lastScanStatus — called every second so "next
  * scan in Ns" counts down smoothly without a network round-trip each time. */
 function renderScanStatus() {
@@ -1398,7 +1531,9 @@ function renderScanStatus() {
   if (!st) return;
   const label = qs("#scanLabel"), pill = qs("#scanState");
   if (st.running) {
-    label.textContent = st.deep ? "deep scanning…" : "scanning…";
+    // st.mode is "" for the regular automatic/system-triggered cycle, or
+    // "quick"/"mass"/"deep"/"dns" for a manually forced one — see ScanMode.
+    label.textContent = SCAN_MODE_LABEL[st.mode] || "scanning…";
     pill.className = "pill pill-active";
   } else {
     label.textContent = "idle";
@@ -1444,6 +1579,25 @@ function updateFilterActiveCount() {
   badge.hidden = active === 0;
 }
 
+/** All the topbar/dropdown panels (filters, notifications, scan/export/
+ * import menus, account menu) toggle independently via their own
+ * document-click listener, but that listener never fires for a click on a
+ * *different* toggle button — those calls stopPropagation() so their own
+ * panel can open without immediately re-closing itself. Left alone, that
+ * meant opening one panel never closed whichever other one was already
+ * open. Every toggle calls closeDropdownPanels(exceptPanel) first so at
+ * most one is ever visible at a time. */
+const dropdownPanels = [];
+function registerDropdownPanel(panel) {
+  dropdownPanels.push(panel);
+  return panel;
+}
+function closeDropdownPanels(except) {
+  for (const p of dropdownPanels) {
+    if (p !== except) p.hidden = true;
+  }
+}
+
 function wireFilters() {
   const onChange = (key, transform) => (e) => {
     state.filters[key] = transform ? transform(e.target.value) : e.target.value;
@@ -1471,10 +1625,12 @@ function wireFilters() {
     renderGraph();
   });
 
-  const filterPanel = qs("#filterPanel");
+  const filterPanel = registerDropdownPanel(qs("#filterPanel"));
   qs("#btnFilters").addEventListener("click", (e) => {
     e.stopPropagation();
-    filterPanel.hidden = !filterPanel.hidden;
+    const opening = filterPanel.hidden;
+    closeDropdownPanels(filterPanel);
+    filterPanel.hidden = !opening;
   });
   filterPanel.addEventListener("click", (e) => e.stopPropagation());
   document.addEventListener("click", () => { filterPanel.hidden = true; });
@@ -1519,10 +1675,12 @@ function wireMiniDash() {
 }
 
 function wireNotifications() {
-  const panel = qs("#notifPanel");
+  const panel = registerDropdownPanel(qs("#notifPanel"));
   qs("#btnNotifs").addEventListener("click", (e) => {
     e.stopPropagation();
-    panel.hidden = !panel.hidden;
+    const opening = panel.hidden;
+    closeDropdownPanels(panel);
+    panel.hidden = !opening;
     if (!panel.hidden) markAllNotificationsRead();
   });
   panel.addEventListener("click", (e) => e.stopPropagation());
@@ -1574,36 +1732,348 @@ function wireViewToggle() {
   });
 }
 
+/** Whichever of the two Graph instances (animated vs. simple-view) is
+ * currently visible — what the +/- zoom buttons and any other
+ * view-agnostic graph control should act on. */
+function activeGraph() {
+  return state.viewMode === "simple" ? simpleGraph : graph;
+}
+
+/** +/- zoom buttons: an explicit, clickable alternative to scroll-to-zoom
+ * for anyone who'd rather not scroll or pinch-zoom to read the graph. */
+function wireZoomControls() {
+  const ZOOM_STEP = 1.4;
+  qs("#btnZoomIn").addEventListener("click", () => activeGraph()?.zoomBy(ZOOM_STEP));
+  qs("#btnZoomOut").addEventListener("click", () => activeGraph()?.zoomBy(1 / ZOOM_STEP));
+  qs("#btnZoomReset").addEventListener("click", () => activeGraph()?.resetZoom());
+}
+
+/** Reads file as JSON, calls apiFn with the parsed result, refreshes the
+ * host/subnet lists, and toasts summarizeFn's description of what happened
+ * — the common shape both import flows share, they only differ in which
+ * endpoint they call and how they describe the result. */
+async function runImport(file, apiFn, summarizeFn) {
+  let doc;
+  try {
+    doc = JSON.parse(await file.text());
+  } catch (err) {
+    toast("That file isn't valid JSON.", "bad");
+    return;
+  }
+  try {
+    const result = await apiFn(doc);
+    await refreshHostsAndSubnets();
+    toast(summarizeFn(result));
+  } catch (err) {
+    toast(`Import failed: ${err.message}`, "bad");
+  }
+}
+
+/** Builds a segments/hosts/ports export document (same snake_case schema as
+ * the server's /api/export/network-map, see exportNetworkMap in
+ * internal/api/export.go) from a client-side host list, so "Export
+ * (filtered)" can restrict the download to what's currently on screen
+ * without a round trip to teach the backend the whole filter set. */
+function exportSegmentsFor(hosts) {
+  const subnetIds = new Set(hosts.map((h) => h.subnetId));
+  return state.subnets
+    .filter((sn) => subnetIds.has(sn.id))
+    .map((sn) => ({ id: `seg-${sn.id}`, name: sn.name || "", cidr: sn.cidr }));
+}
+
+/** Appends this host's risk findings (see riskBadge/riskForPorts) to its
+ * notes, mirroring hostExportNotes in internal/api/export.go, so the
+ * recommendations the app surfaces in-app survive into the exported file. */
+function exportNotesFor(h) {
+  if (!(h.riskReasons || []).length) return h.notes || "";
+  const findings = "Flagged: " + h.riskReasons.join("; ");
+  return h.notes ? `${h.notes}\n\n${findings}` : findings;
+}
+
+function exportHostFor(h) {
+  const eh = { id: `host-${h.id}`, segment_id: `seg-${h.subnetId}` };
+  if (h.hostname) eh.hostname = h.hostname;
+  eh.ip = h.ip;
+  if (h.mac) eh.mac = h.mac;
+  eh.management_ip = h.ip;
+  if (h.vendor) eh.vendor = h.vendor;
+  const notes = exportNotesFor(h);
+  if (notes) eh.notes = notes;
+  return eh;
+}
+
+function exportPortsFor(h) {
+  return (h.ports || []).map((p) => {
+    const ep = { host_id: `host-${h.id}`, protocol: p.protocol, port: p.port, state: p.state };
+    if (p.service) ep.service = p.service;
+    const version = p.version || p.product;
+    if (version) ep.version = version;
+    if (p.banner) ep.notes = p.banner;
+    return ep;
+  });
+}
+
+function buildExportDoc(hosts) {
+  return {
+    segments: exportSegmentsFor(hosts),
+    hosts: hosts.map(exportHostFor),
+    ports: hosts.flatMap(exportPortsFor),
+  };
+}
+
+function exportTimestamp() {
+  return new Date().toISOString().replace(/[:.]/g, "").replace("T", "-").slice(0, 15);
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function downloadJSON(doc, filenamePrefix) {
+  downloadBlob(new Blob([JSON.stringify(doc)], { type: "application/json" }), `${filenamePrefix}-${exportTimestamp()}.json`);
+}
+
+/** Hosts flagged as priority — riskLevel set and not yet acknowledged — the
+ * same definition the dashboard's "priority" tile and ⚑ filter use (see
+ * renderCounts/priorityOnly), sorted worst-first for the report. Uses
+ * visibleHosts() rather than filteredHosts() so the report always covers
+ * every priority host regardless of whatever search/status/tag filter
+ * happens to be active, the same way the dashboard counts do. */
+function priorityReportHosts() {
+  return visibleHosts()
+    .filter((h) => h.riskLevel && !h.acknowledged)
+    .slice()
+    .sort((a, b) => {
+      const ra = RISK_SORT_RANK[a.riskLevel] || 0;
+      const rb = RISK_SORT_RANK[b.riskLevel] || 0;
+      if (ra !== rb) return rb - ra;
+      return a.ip.localeCompare(b.ip, undefined, { numeric: true });
+    });
+}
+
+function csvCell(value) {
+  const s = String(value ?? "");
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+function buildPriorityReportCsv(hosts) {
+  const header = ["IP", "Hostname", "Subnet", "Risk Level", "Findings", "MAC", "Vendor"];
+  const rows = hosts.map((h) => [
+    h.ip,
+    h.hostname || "",
+    subnetById(h.subnetId)?.cidr || "",
+    h.riskLevel,
+    (h.riskReasons || []).join("; "),
+    h.mac || "",
+    h.vendor || "",
+  ]);
+  return [header, ...rows].map((row) => row.map(csvCell).join(",")).join("\r\n");
+}
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+
+function priorityReportHtmlRow(h) {
+  const findings = (h.riskReasons || []).map((r) => `<li>${escapeHtml(r)}</li>`).join("");
+  return `<tr>
+    <td>${escapeHtml(h.ip)}</td>
+    <td>${escapeHtml(h.hostname || "—")}</td>
+    <td>${escapeHtml(subnetById(h.subnetId)?.cidr || "—")}</td>
+    <td><span class="badge badge-${h.riskLevel}">${escapeHtml(h.riskLevel.toUpperCase())}</span></td>
+    <td><ul>${findings}</ul></td>
+  </tr>`;
+}
+
+function buildPriorityReportHtml(hosts) {
+  const counts = { critical: 0, warning: 0, info: 0 };
+  for (const h of hosts) counts[h.riskLevel] = (counts[h.riskLevel] || 0) + 1;
+  const rows = hosts.map(priorityReportHtmlRow).join("") ||
+    `<tr><td colspan="5">No priority hosts — nothing to report.</td></tr>`;
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Priority Host Report</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 32px; background: #12141a; color: #e6e6e6; }
+  h1 { margin: 0 0 4px; font-size: 22px; }
+  .meta { color: #9aa0a6; font-size: 13px; margin-bottom: 24px; }
+  .summary { display: flex; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
+  .summary div { padding: 10px 16px; border-radius: 8px; background: #1c1f27; font-size: 13px; min-width: 90px; }
+  .summary strong { display: block; font-size: 20px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #2a2e37; vertical-align: top; }
+  th { color: #9aa0a6; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: .04em; }
+  ul { margin: 0; padding-left: 18px; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; white-space: nowrap; }
+  .badge-critical { background: #4a1414; color: #ff6b6b; }
+  .badge-warning { background: #4a3a10; color: #fab219; }
+  .badge-info { background: #16324a; color: #6cb6ff; }
+  @media print { body { background: #fff; color: #000; } .summary div { background: #f2f2f2; } }
+</style>
+</head>
+<body>
+  <h1>Priority Host Report</h1>
+  <div class="meta">Generated ${escapeHtml(new Date().toLocaleString())} — Network Enumerator</div>
+  <div class="summary">
+    <div><strong>${hosts.length}</strong>Priority hosts</div>
+    <div><strong>${counts.critical}</strong>Critical</div>
+    <div><strong>${counts.warning}</strong>Warning</div>
+    <div><strong>${counts.info}</strong>Info</div>
+  </div>
+  <table>
+    <thead><tr><th>IP</th><th>Hostname</th><th>Subnet</th><th>Risk</th><th>Findings</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+</body>
+</html>`;
+}
+
+function downloadPriorityReport(format) {
+  const hosts = priorityReportHosts();
+  const stamp = exportTimestamp();
+  if (format === "csv") {
+    downloadBlob(new Blob([buildPriorityReportCsv(hosts)], { type: "text/csv" }), `priority-report-${stamp}.csv`);
+  } else {
+    downloadBlob(new Blob([buildPriorityReportHtml(hosts)], { type: "text/html" }), `priority-report-${stamp}.html`);
+  }
+}
+
+/** "Export ▾" mirrors the "Import ▾" menu right next to it:
+ *  - Export (filtered): only the hosts matching the current search/status/
+ *    tag/risk/etc. filters (see filteredHosts) and hidden-subnet setting —
+ *    built client-side since the backend has no equivalent filter API.
+ *  - Export (all, including hidden): the complete network map regardless of
+ *    any UI filter, via the same download the button used to be.
+ *  - Reports (HTML/CSV): a human-readable report of every priority-flagged
+ *    host and its findings, for handing to someone who isn't going to load
+ *    the network map JSON back into this app. */
+function wireExport() {
+  const exportMenu = registerDropdownPanel(qs("#exportMenu"));
+  qs("#btnExportMenuToggle").addEventListener("click", (e) => {
+    e.stopPropagation();
+    const opening = exportMenu.hidden;
+    closeDropdownPanels(exportMenu);
+    exportMenu.hidden = !opening;
+  });
+  exportMenu.addEventListener("click", (e) => e.stopPropagation());
+  document.addEventListener("click", () => { exportMenu.hidden = true; });
+
+  qs("#btnExportFiltered").addEventListener("click", () => {
+    exportMenu.hidden = true;
+    downloadJSON(buildExportDoc(filteredHosts()), "network-map-export-filtered");
+  });
+  qs("#btnExportAll").addEventListener("click", () => {
+    exportMenu.hidden = true;
+    window.location.href = "/api/export/network-map";
+  });
+  qs("#btnReportPriorityHtml").addEventListener("click", () => {
+    exportMenu.hidden = true;
+    downloadPriorityReport("html");
+  });
+  qs("#btnReportPriorityCsv").addEventListener("click", () => {
+    exportMenu.hidden = true;
+    downloadPriorityReport("csv");
+  });
+}
+
+/** Two import flows share one dropdown menu, mirroring the "Scan now ▾"
+ * menu right next to it:
+ *  - Network map (JSON): restores subnets/hosts/open-ports from a network
+ *    map previously downloaded via "Export JSON" — mainly for a fresh run
+ *    (in-memory, or a -db-file that doesn't exist yet) that would otherwise
+ *    start from a completely empty inventory.
+ *  - DNS recon scan (JSON): enriches hosts with hostnames from a dnsrecon
+ *    -j scan run outside this app, creating subnets/hosts that don't exist
+ *    yet.
+ * Both are additive: re-importing, or importing on top of a database that
+ * already has scan data, only ever fills in gaps. */
+function wireImport() {
+  const importMenu = registerDropdownPanel(qs("#importMenu"));
+  qs("#btnImportMenuToggle").addEventListener("click", (e) => {
+    e.stopPropagation();
+    const opening = importMenu.hidden;
+    closeDropdownPanels(importMenu);
+    importMenu.hidden = !opening;
+  });
+  importMenu.addEventListener("click", (e) => e.stopPropagation());
+  document.addEventListener("click", () => { importMenu.hidden = true; });
+
+  const wireImportItem = (buttonId, fileInputId, apiFn, summarizeFn) => {
+    const fileInput = qs(fileInputId);
+    qs(buttonId).addEventListener("click", () => {
+      importMenu.hidden = true;
+      fileInput.click();
+    });
+    fileInput.addEventListener("change", async () => {
+      const file = fileInput.files[0];
+      fileInput.value = ""; // so picking the same file again still fires "change"
+      if (file) await runImport(file, apiFn, summarizeFn);
+    });
+  };
+
+  wireImportItem("#btnImportNetworkMap", "#importNetworkMapFileInput", Api.importNetworkMap,
+    (r) => `Imported ${r.segments} segment(s), ${r.hosts} host(s) (${r.newHosts} new), ${r.newPorts} new open port(s).`);
+  wireImportItem("#btnImportDnsRecon", "#importDnsReconFileInput", Api.importDnsRecon,
+    (r) => `Imported dnsrecon scan: ${r.addresses} address(es), ${r.newSubnets} new subnet(s), ${r.newHosts} new host(s).`);
+}
+
 function wireTopbar() {
-  const scanMenu = qs("#scanMenu");
+  const scanMenu = registerDropdownPanel(qs("#scanMenu"));
   qs("#btnScanMenuToggle").addEventListener("click", (e) => {
     e.stopPropagation();
-    scanMenu.hidden = !scanMenu.hidden;
+    const opening = scanMenu.hidden;
+    closeDropdownPanels(scanMenu);
+    scanMenu.hidden = !opening;
   });
   scanMenu.addEventListener("click", (e) => e.stopPropagation());
   document.addEventListener("click", () => { scanMenu.hidden = true; });
 
-  qs("#btnScanNow").addEventListener("click", async () => {
+  qs("#btnScanQuick").addEventListener("click", async () => {
     scanMenu.hidden = true;
-    await Api.scanNow();
-    pollScanStatus();
-    toast("Scan triggered.");
+    try {
+      await Api.quickScanAll();
+      pollScanStatus();
+      toast("Quick scan triggered.");
+    } catch (err) {
+      toast(err.message, "bad");
+    }
   });
-  qs("#btnDeepScanAll").addEventListener("click", () => {
+  qs("#btnScanMass").addEventListener("click", () => {
     scanMenu.hidden = true;
-    qs("#dsmConfirm").checked = false;
-    qs("#dsmProceed").disabled = true;
-    showModal("#deepScanModal");
+    openScanConfirmModal("mass");
+  });
+  qs("#btnScanDeepAll").addEventListener("click", () => {
+    scanMenu.hidden = true;
+    openScanConfirmModal("deep");
+  });
+  qs("#btnScanReverseDns").addEventListener("click", () => {
+    scanMenu.hidden = true;
+    openScanConfirmModal("dns");
   });
 
-  qs("#btnAddSubnet").addEventListener("click", () => { qs("#smError").hidden = true; qs("#smCIDR").value = ""; qs("#smName").value = ""; showModal("#subnetModal"); });
+  qs("#btnAddSubnet").addEventListener("click", () => openSubnetModal(null));
   qs("#btnAddHost").addEventListener("click", () => { qs("#hamError").hidden = true; qs("#hamIP").value = ""; qs("#hamHostname").value = ""; qs("#hamNotes").value = ""; renderTagSelects(); showModal("#hostAddModal"); });
   qs("#btnTags").addEventListener("click", () => { renderTagManager(); showModal("#tagModal"); });
+  wireExport();
+  wireImport();
 
-  const accountMenu = qs("#accountMenu");
+  const accountMenu = registerDropdownPanel(qs("#accountMenu"));
   qs("#btnAccountMenu").addEventListener("click", (e) => {
     e.stopPropagation();
-    accountMenu.hidden = !accountMenu.hidden;
+    const opening = accountMenu.hidden;
+    closeDropdownPanels(accountMenu);
+    accountMenu.hidden = !opening;
   });
   accountMenu.addEventListener("click", (e) => e.stopPropagation());
   document.addEventListener("click", () => { accountMenu.hidden = true; });
@@ -1622,16 +2092,43 @@ async function removeSubnet(id) {
   await refreshHosts();
 }
 
+// Set while #subnetModal is open for renaming an existing subnet (see
+// openSubnetModal) rather than adding a new one; null means "add" mode.
+let editingSubnetId = null;
+
+/** Opens #subnetModal in "add" mode (sn omitted) or "edit" mode (existing
+ * subnet passed) — edit mode locks the CIDR field, since the IP range isn't
+ * editable after creation (UpsertAutoSubnet matches on it, and hosts
+ * reference the subnet by id, not by address range). */
+function openSubnetModal(sn) {
+  qs("#smError").hidden = true;
+  editingSubnetId = sn ? sn.id : null;
+  qs("#smHeading").textContent = sn ? "Edit subnet" : "Add subnet";
+  qs("#smCIDR").value = sn ? sn.cidr : "";
+  qs("#smCIDR").disabled = !!sn;
+  qs("#smCidrLock").hidden = !sn;
+  qs("#smName").value = sn ? (sn.name || "") : "";
+  qs("#smSubmit").textContent = sn ? "Save" : "Add & scan";
+  showModal("#subnetModal");
+}
+
 function wireSubnetForm() {
   wireModal("#subnetModal", "#smClose");
   qs("#smSubmit").addEventListener("click", async () => {
-    const cidr = qs("#smCIDR").value.trim();
     const name = qs("#smName").value.trim();
     try {
-      await Api.addSubnet(cidr, name);
-      closeModal("#subnetModal");
-      await refreshSubnets();
-      toast(`Subnet ${cidr} added. Scan triggered.`);
+      if (editingSubnetId) {
+        await Api.renameSubnet(editingSubnetId, name);
+        closeModal("#subnetModal");
+        await refreshSubnets();
+        toast("Subnet renamed.");
+      } else {
+        const cidr = qs("#smCIDR").value.trim();
+        await Api.addSubnet(cidr, name);
+        closeModal("#subnetModal");
+        await refreshSubnets();
+        toast(`Subnet ${cidr} added. Scan triggered.`);
+      }
     } catch (err) {
       qs("#smError").textContent = err.message;
       qs("#smError").hidden = false;
@@ -1840,20 +2337,68 @@ function wireRiskRuleModal() {
 }
 
 /* ---------------------------------------------------------------------- */
-/* deep scan confirm modal                                               */
+/* mass/deep/reverse-DNS scan confirm modal                              */
 /* ---------------------------------------------------------------------- */
 
-function wireDeepScanModal() {
-  wireModal("#deepScanModal", "#dsmClose");
-  qs("#dsmConfirm").addEventListener("change", (e) => {
-    qs("#dsmProceed").disabled = !e.target.checked;
+// One shared modal for every forced-technique action — they only differ in
+// copy and which endpoint Proceed calls.
+const SCAN_CONFIRM_COPY = {
+  mass: {
+    title: "Mass scan all hosts (nmap)",
+    body: "This forces an nmap sweep of the common-port list across every host, regardless of the configured scan method. It's noisier than the built-in prober and can take a while on a large network.",
+    confirmLabel: "I understand this forces nmap and may take a while",
+    proceedLabel: "Start mass scan",
+    api: () => Api.massScanAll(),
+    toastMessage: "Mass scan triggered — forcing an nmap sweep across every host.",
+  },
+  deep: {
+    title: "Deep scan all hosts (nmap)",
+    body: "This forces an nmap sweep of every TCP port (1–65535) on every host instead of the usual common-port list. It can take a long time on a large network, and it blocks the normal scheduled scan cycle from running until it finishes.",
+    confirmLabel: "I understand this will take a while and block normal scanning",
+    proceedLabel: "Start deep scan",
+    api: () => Api.deepScanAll(),
+    toastMessage: "Deep scan triggered — scanning every port on every host. This can take a long time on a large network.",
+  },
+  dns: {
+    title: "Reverse DNS scan all hosts",
+    body: "This sweeps every address in every subnet for a PTR record (dnsrecon if installed, otherwise dig -x per address), independent of ping/TCP/ARP discovery. Hosts found this way are recorded but not marked up until an open port confirms them. Can be slow on a large network without dnsrecon installed — check the tools icon in the top bar.",
+    confirmLabel: "I understand this may take a while, especially without dnsrecon",
+    proceedLabel: "Start reverse DNS scan",
+    api: () => Api.reverseDnsScanAll(),
+    toastMessage: "Reverse DNS scan triggered — sweeping every address for a PTR record.",
+  },
+};
+
+let pendingScanMode = null; // "mass" | "deep" — which one Proceed should run
+
+function openScanConfirmModal(mode) {
+  pendingScanMode = mode;
+  const copy = SCAN_CONFIRM_COPY[mode];
+  qs("#scmTitle").textContent = copy.title;
+  qs("#scmBody").textContent = copy.body;
+  qs("#scmConfirmLabel").textContent = copy.confirmLabel;
+  qs("#scmProceed").textContent = copy.proceedLabel;
+  qs("#scmConfirm").checked = false;
+  qs("#scmProceed").disabled = true;
+  showModal("#scanConfirmModal");
+}
+
+function wireScanConfirmModal() {
+  wireModal("#scanConfirmModal", "#scmClose");
+  qs("#scmConfirm").addEventListener("change", (e) => {
+    qs("#scmProceed").disabled = !e.target.checked;
   });
-  qs("#dsmCancel").addEventListener("click", () => closeModal("#deepScanModal"));
-  qs("#dsmProceed").addEventListener("click", async () => {
-    closeModal("#deepScanModal");
-    await Api.deepScanAll();
-    pollScanStatus();
-    toast("Deep scan triggered — scanning every port on every host. This can take a long time on a large network.", "warn");
+  qs("#scmCancel").addEventListener("click", () => closeModal("#scanConfirmModal"));
+  qs("#scmProceed").addEventListener("click", async () => {
+    closeModal("#scanConfirmModal");
+    const copy = SCAN_CONFIRM_COPY[pendingScanMode];
+    try {
+      await copy.api();
+      pollScanStatus();
+      toast(copy.toastMessage, "warn");
+    } catch (err) {
+      toast(err.message, "bad");
+    }
   });
 }
 
@@ -1944,6 +2489,14 @@ function wireSettings() {
 let appStarted = false;
 
 function showLoginScreen() {
+  // Stop polling/SSE the moment the session is known dead — otherwise the
+  // 4s scan-status poll and the SSE reconnect both keep hitting the server
+  // with a doomed request forever (a session naturally expires after 24h,
+  // or a server restart wipes the in-memory session store), 401ing in the
+  // background with nothing on screen to show for it. Safe to call even
+  // when nothing is running yet (page just loaded, never logged in).
+  stopLiveUpdates();
+
   // Called redundantly whenever a stray in-flight request (a background
   // poll, an SSE reconnect) lands a 401 after the login screen is already
   // showing — e.g. right after logout. Only reset the form and steal focus
@@ -1976,12 +2529,45 @@ async function loadAppData() {
   renderRiskRules();
   renderScanMethodSettings(settings);
   renderVersionInfo(settings);
+  // Fetched separately, not part of the Promise.all above: PATH doesn't
+  // change over the life of the server, so a transient failure here just
+  // means trying again next login rather than something worth failing the
+  // rest of the app's data load over.
+  Api.toolStatus().then(renderToolStatus).catch(() => {});
+}
+
+/** Renders the combined tools pill (nmap/netdiscover/dnsrecon) shown before
+ * the live-connection icon: an at-a-glance "N/M available" count, with a
+ * hover panel (#toolStatusPanel, see .tool-status-wrap in style.css)
+ * breaking down each tool's availability and, when installed, its exact
+ * path — fetched once per login since PATH doesn't change over the life of
+ * a running server, unlike the polled scan-status/active-users pills next
+ * to it. The panel is a sibling element rather than a data-tooltip on the
+ * pill itself, since this function replaces the pill's whole className on
+ * every refresh below — any class living on the pill would get wiped. */
+function renderToolStatus(tools) {
+  const available = tools.filter((t) => t.available).length;
+  let pillClass = "pill-muted";
+  if (available === tools.length) pillClass = "pill-good";
+  else if (available === 0) pillClass = "pill-bad";
+  qs("#toolStatusCount").textContent = `${available}/${tools.length}`;
+  qs("#toolStatus").className = "pill " + pillClass;
+
+  const panel = qs("#toolStatusPanel");
+  panel.innerHTML = "";
+  for (const t of tools) {
+    panel.appendChild(el("div", { class: "tool-status-row" }, [
+      el("span", { class: "tool-status-mark " + (t.available ? "tool-status-ok" : "tool-status-bad"), text: t.available ? "✓" : "✗" }),
+      `${t.name} — ${t.available ? t.path : "not found on PATH"}`,
+    ]));
+  }
 }
 
 async function startApp() {
   showApp();
   if (appStarted) {
     await loadAppData(); // returning from a re-login after a session expiry
+    startLiveUpdates(); // stopLiveUpdates() tore these down when the session went stale
     return;
   }
   appStarted = true;
@@ -1992,6 +2578,7 @@ async function startApp() {
   wireTabs();
   wireGraphControls();
   wireViewToggle();
+  wireZoomControls();
   wireFilters();
   wireMiniDash();
   wireNotifications();
@@ -2001,14 +2588,12 @@ async function startApp() {
   wireTagManager();
   wireSettings();
   wireRiskRuleModal();
-  wireDeepScanModal();
+  wireScanConfirmModal();
   wireModal("#hostModal", "#hmClose");
 
   await loadAppData();
 
-  connectSSE();
-  pollScanStatus();
-  setInterval(pollScanStatus, 4000);
+  startLiveUpdates();
   setInterval(renderScanStatus, 1000); // ticks the "next scan in Ns" countdown between polls
   setInterval(renderNotifPanel, 30000); // keep relative timestamps fresh
   setInterval(renderHostList, 30000);

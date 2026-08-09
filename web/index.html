@@ -34,6 +34,12 @@
     </div>
 
     <div class="topbar-status">
+      <div class="tool-status-wrap">
+        <span id="toolStatus" class="pill pill-muted" tabindex="0">
+          <span class="dot"></span><span aria-hidden="true">🛠</span><span id="toolStatusCount">…</span>
+        </span>
+        <div id="toolStatusPanel" class="tool-status-panel">Checking scan tool availability…</div>
+      </div>
       <span id="connState" class="pill pill-muted" title="Live update connection">
         <span class="dot"></span><span id="connLabel">connecting…</span>
       </span>
@@ -41,6 +47,9 @@
         <span class="dot"></span><span id="scanLabel">idle</span>
       </span>
       <span id="lastScan" class="muted small"></span>
+      <span id="activeUsers" class="pill pill-muted" title="Users currently signed in">
+        <span aria-hidden="true">👤</span><span id="activeUsersCount">—</span>
+      </span>
     </div>
 
     <div class="mini-dash" id="miniDash" title="Click a counter to filter">
@@ -54,15 +63,36 @@
       <div class="notif-wrap">
         <button id="btnScanMenuToggle" class="btn btn-primary" aria-haspopup="true">Scan now ▾</button>
         <div id="scanMenu" class="notif-panel account-menu" hidden>
-          <button id="btnScanNow" class="account-menu-item">Quick scan</button>
-          <button id="btnDeepScanAll" class="account-menu-item" title="Scan every TCP port (1-65535) on every host — much slower than a normal scan">Deep scan (all ports)…</button>
+          <button id="btnScanQuick" class="account-menu-item" title="Fast TCP ping/connect scan using the built-in prober — no nmap needed">Quick scan (TCP ping)</button>
+          <button id="btnScanMass" class="account-menu-item" title="Force an nmap sweep (common ports) across every host">Mass scan (nmap)…</button>
+          <button id="btnScanDeepAll" class="account-menu-item" title="Force an nmap sweep of every TCP port (1-65535) on every host — much slower than a normal scan">Deep scan (nmap, all ports)…</button>
+          <button id="btnScanReverseDns" class="account-menu-item" title="Sweep every address for a PTR record (dnsrecon if installed, else dig -x), independent of ping/TCP/ARP discovery">Reverse DNS scan…</button>
         </div>
       </div>
       <button id="btnViewToggle" class="btn" title="Switch between the animated graph and a static expand/collapse tree — same segments-and-hosts view, no canvas animation, easier on remote sessions with poor video acceleration" aria-pressed="false">Simple view</button>
       <button id="btnAddSubnet" class="btn">+ Subnet</button>
       <button id="btnAddHost" class="btn">+ Host</button>
       <button id="btnTags" class="btn">Tags</button>
-      <a id="btnExport" class="btn" href="/api/export/network-map" title="Download the current network map as JSON">Export JSON</a>
+      <div class="notif-wrap">
+        <button id="btnExportMenuToggle" class="btn" aria-haspopup="true">Export ▾</button>
+        <div id="exportMenu" class="notif-panel account-menu" hidden>
+          <button id="btnExportFiltered" class="account-menu-item" title="Download only the subnets and hosts matching your current search/filters, as JSON">Export (filtered)</button>
+          <button id="btnExportAll" class="account-menu-item" title="Download the complete network map as JSON, including hidden subnets and their hosts">Export (all, including hidden)</button>
+          <div class="account-menu-divider"></div>
+          <div class="account-menu-label">Reports</div>
+          <button id="btnReportPriorityHtml" class="account-menu-item" title="Download a readable HTML report of every priority-flagged host and its findings">Priority report (HTML)</button>
+          <button id="btnReportPriorityCsv" class="account-menu-item" title="Download a CSV report of every priority-flagged host and its findings">Priority report (CSV)</button>
+        </div>
+      </div>
+      <div class="notif-wrap">
+        <button id="btnImportMenuToggle" class="btn" aria-haspopup="true">Import ▾</button>
+        <div id="importMenu" class="notif-panel account-menu" hidden>
+          <button id="btnImportNetworkMap" class="account-menu-item" title="Restore subnets, hosts, and open ports from a previously exported network map JSON file">Network map (JSON)…</button>
+          <button id="btnImportDnsRecon" class="account-menu-item" title="Enrich hosts with hostnames from a dnsrecon -j JSON scan; adds subnets/hosts that don't exist yet">DNS recon scan (JSON)…</button>
+        </div>
+      </div>
+      <input id="importNetworkMapFileInput" type="file" accept="application/json,.json" hidden>
+      <input id="importDnsReconFileInput" type="file" accept="application/json,.json" hidden>
       <div class="notif-wrap">
         <button id="btnNotifs" class="btn-icon notif-bell" title="Notifications" aria-label="Notifications">
           🔔<span id="notifBadge" class="notif-badge" hidden>0</span>
@@ -97,6 +127,11 @@
           <div class="legend-row"><span class="swatch swatch-bucket"></span>range (click to expand)</div>
         </div>
         <button id="btnCollapseAll" type="button" class="btn btn-small graph-collapse-btn">Collapse all</button>
+      </div>
+      <div class="zoom-controls">
+        <button type="button" id="btnZoomIn" title="Zoom in" aria-label="Zoom in">+</button>
+        <button type="button" id="btnZoomReset" title="Reset zoom" aria-label="Reset zoom">⊙</button>
+        <button type="button" id="btnZoomOut" title="Zoom out" aria-label="Zoom out">−</button>
       </div>
       <div class="graph-hint muted small">scroll to zoom · drag to pan · drag a node to move it · click a host for details · click a subnet to collapse it · click a dashed square to expand a large subnet</div>
       <div id="emptyState" class="empty-state" hidden>
@@ -133,6 +168,7 @@
               <select id="filterStatus">
                 <option value="">All status</option>
                 <option value="up">Up</option>
+                <option value="unknown">Unconfirmed</option>
                 <option value="down">Down</option>
               </select>
               <label class="field-label" for="filterRisk">Risk level</label>
@@ -175,7 +211,7 @@
 
           <section class="settings-section">
             <h3>Scanning</h3>
-            <p class="muted small">Choose how hosts and ports are discovered. <span id="stNmapStatus"></span></p>
+            <p class="muted small">Choose how the regular automatic scan cycle discovers hosts and ports — the "Scan now ▾" menu's Quick/Mass/Deep actions always force their own technique regardless of this setting. <span id="stNmapStatus"></span></p>
             <label class="field-label" for="stScanMethod">Scan method</label>
             <select id="stScanMethod">
               <option value="auto">Auto — nmap if available, otherwise built-in</option>
@@ -224,9 +260,18 @@
       <div id="hmAckRow" class="hm-ack-row" hidden></div>
       <div class="hm-meta">
         <div><span class="muted small">Status</span><div id="hmStatus"></div></div>
-        <div><span class="muted small">Hostname</span><div id="hmHostname">—</div></div>
-        <div><span class="muted small">MAC</span><div id="hmMac">—</div></div>
-        <div><span class="muted small">Source</span><div id="hmSource">—</div></div>
+        <div>
+          <span class="muted small">Source</span>
+          <div id="hmSource">—</div>
+        </div>
+        <div>
+          <span class="muted small">Hostname</span>
+          <input id="hmHostnameInput" type="text" placeholder="auto-filled, or set manually" autocomplete="off">
+        </div>
+        <div>
+          <span class="muted small">MAC</span>
+          <input id="hmMacInput" type="text" placeholder="auto-filled, or set manually" autocomplete="off">
+        </div>
         <div><span class="muted small">First seen</span><div id="hmFirstSeen">—</div></div>
         <div><span class="muted small">Last seen</span><div id="hmLastSeen">—</div></div>
       </div>
@@ -268,10 +313,11 @@
 <!-- Add subnet modal -->
 <div id="subnetModal" class="modal-backdrop" hidden>
   <div class="modal modal-sm" role="dialog" aria-modal="true">
-    <div class="modal-header"><h2>Add subnet</h2><button class="btn-icon" id="smClose" aria-label="Close">✕</button></div>
+    <div class="modal-header"><h2 id="smHeading">Add subnet</h2><button class="btn-icon" id="smClose" aria-label="Close">✕</button></div>
     <div class="modal-body">
       <label class="field-label" for="smCIDR">CIDR</label>
       <input id="smCIDR" placeholder="10.0.0.0/24">
+      <p id="smCidrLock" class="muted small" hidden>The IP range can't be changed once a subnet is created.</p>
       <label class="field-label" for="smName">Name (optional)</label>
       <input id="smName" placeholder="e.g. Ops VLAN">
       <p id="smError" class="error small" hidden></p>
@@ -349,19 +395,19 @@
   </div>
 </div>
 
-<!-- Deep scan confirm modal -->
-<div id="deepScanModal" class="modal-backdrop" hidden>
+<!-- Mass/deep scan confirm modal (shared — content filled in per mode by openScanConfirmModal) -->
+<div id="scanConfirmModal" class="modal-backdrop" hidden>
   <div class="modal modal-sm" role="dialog" aria-modal="true">
-    <div class="modal-header"><h2>Deep scan all hosts</h2><button class="btn-icon" id="dsmClose" aria-label="Close">✕</button></div>
+    <div class="modal-header"><h2 id="scmTitle">Scan all hosts</h2><button class="btn-icon" id="scmClose" aria-label="Close">✕</button></div>
     <div class="modal-body">
-      <p>This scans every TCP port (1–65535) on every host instead of the usual common-port list. It can take a long time on a large network, and it blocks the normal scheduled scan cycle from running until it finishes.</p>
-      <label class="checkbox-inline checkbox-wrap"><input type="checkbox" id="dsmConfirm"> I understand this will take a while and block normal scanning</label>
+      <p id="scmBody"></p>
+      <label class="checkbox-inline checkbox-wrap"><input type="checkbox" id="scmConfirm"> <span id="scmConfirmLabel"></span></label>
     </div>
     <div class="modal-footer">
       <span></span>
       <div class="modal-actions">
-        <button id="dsmCancel" class="btn btn-small">Cancel</button>
-        <button id="dsmProceed" class="btn btn-danger btn-small" disabled>Start deep scan</button>
+        <button id="scmCancel" class="btn btn-small">Cancel</button>
+        <button id="scmProceed" class="btn btn-danger btn-small" disabled></button>
       </div>
     </div>
   </div>

@@ -21,13 +21,18 @@ type Subnet struct {
 }
 
 type Host struct {
-	ID        int64     `json:"id"`
-	SubnetID  int64     `json:"subnetId"`
-	IP        string    `json:"ip"`
-	MAC       string    `json:"mac,omitempty"`
-	Hostname  string    `json:"hostname,omitempty"`
-	Vendor    string    `json:"vendor,omitempty"`
-	Status    string    `json:"status"` // "up" | "down"
+	ID       int64  `json:"id"`
+	SubnetID int64  `json:"subnetId"`
+	IP       string `json:"ip"`
+	MAC      string `json:"mac,omitempty"`
+	Hostname string `json:"hostname,omitempty"`
+	Vendor   string `json:"vendor,omitempty"`
+	// Status is "up" (confirmed alive via ping/TCP/ARP or an open port),
+	// "down" (was up, missed enough consecutive scans), or "unknown" (found
+	// only via a dig -x PTR record — no live probe has ever confirmed it,
+	// and a PTR record persists whether or not the device is actually up, so
+	// it can never earn "up" or "down" on its own; only an open port can).
+	Status    string    `json:"status"`
 	Source    string    `json:"source"` // "auto" | "manual"
 	Notes     string    `json:"notes,omitempty"`
 	FirstSeen time.Time `json:"firstSeen"`
@@ -117,10 +122,27 @@ type Event struct {
 }
 
 type ScanStatus struct {
-	Running      bool      `json:"running"`
-	Deep         bool      `json:"deep"` // true while the currently-running cycle is scanning every port, not just CommonPorts
+	Running bool `json:"running"`
+	// Mode is "" while the currently-running cycle is the regular automatic/
+	// system-triggered one (respects the configured Settings scan-method
+	// preference), or "quick"/"mass"/"deep" while it's a manually triggered
+	// cycle that forced a specific technique regardless of that preference —
+	// see Scanner.ScanMode*. Empty (not running, or the regular cycle) once
+	// the cycle finishes, same as before.
+	Mode         string    `json:"mode,omitempty"`
 	LastStarted  time.Time `json:"lastStarted,omitempty"`
 	LastFinished time.Time `json:"lastFinished,omitempty"`
 	HostsScanned int       `json:"hostsScanned"`
 	IntervalSec  int       `json:"intervalSec"`
+}
+
+// ToolStatus reports whether one optional external scanning tool (nmap,
+// netdiscover, dnsrecon) is installed on this host, and where — shown in the
+// topbar so it's obvious up front why, say, ARP-only hosts or mass/deep
+// scans aren't available rather than that only surfacing as a failed
+// request later.
+type ToolStatus struct {
+	Name      string `json:"name"`
+	Available bool   `json:"available"`
+	Path      string `json:"path,omitempty"`
 }
