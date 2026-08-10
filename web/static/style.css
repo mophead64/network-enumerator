@@ -284,6 +284,11 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .host-subrow { background: var(--surface-2); }
 .host-subrow td:nth-child(2) { padding-left: 24px; }
 
+.side-pane-actions {
+  display: flex; gap: 8px; padding: 10px 10px 0; flex: 0 0 auto;
+}
+.side-pane-actions .btn { flex: 1; }
+
 .tabs { display: flex; border-bottom: 1px solid var(--border); flex: 0 0 auto; }
 .tab {
   flex: 1;

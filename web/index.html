@@ -76,8 +76,6 @@
           <button id="btnViewTable" class="account-menu-item" data-view="table" title="Subnets and hosts as searchable tables — expand a subnet row to see its hosts">Table view</button>
         </div>
       </div>
-      <button id="btnAddSubnet" class="btn">+ Subnet</button>
-      <button id="btnAddHost" class="btn">+ Host</button>
       <button id="btnTags" class="btn">Tags</button>
       <div class="notif-wrap">
         <button id="btnExportMenuToggle" class="btn" aria-haspopup="true">Export ▾</button>
@@ -171,6 +169,9 @@
       </nav>
 
       <div class="tab-panel" id="panel-hosts">
+        <div class="side-pane-actions">
+          <button id="btnAddHost" class="btn">+ Host</button>
+        </div>
         <div class="filter-bar">
           <input id="hostSearch" type="search" placeholder="Search IP, hostname, MAC, vendor, notes, port…">
           <button id="btnPriorityOnly" type="button" class="chip-toggle" aria-pressed="false">⚑ Priority only</button>
@@ -214,6 +215,9 @@
       </div>
 
       <div class="tab-panel" id="panel-subnets" hidden>
+        <div class="side-pane-actions">
+          <button id="btnAddSubnet" class="btn">+ Subnet</button>
+        </div>
         <div id="subnetList" class="subnet-list"></div>
       </div>
 
