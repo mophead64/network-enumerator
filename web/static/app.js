@@ -91,13 +91,11 @@ function networkCIDR(ip, prefix) {
   return intToIp((n & mask) >>> 0) + "/" + prefix;
 }
 
-/** Groups hosts one bucketing level below `prefix`, the same rule the
- * canvas graph's Graph._layoutLevel uses (stepping in octets, capped at
- * /24 where individual hosts show instead of another bucket layer) — kept
- * as a separate pure function (no canvas/positioning) so the simple-view
- * tree can reuse the exact same grouping without depending on the Graph
- * class. Returns null at a leaf level (prefix >= 24 or unknown), meaning
- * "render these hosts directly, no further grouping". */
+/** Groups hosts one bucketing level below `prefix` — stepping in octets,
+ * capped at /24 where individual hosts show instead of another bucket
+ * layer — used by Graph._layoutLevel. Returns null at a leaf level
+ * (prefix >= 24 or unknown), meaning "render these hosts directly, no
+ * further grouping". */
 function nextTreeLevel(hosts, prefix) {
   if (prefix === null || prefix >= 24) return null;
   const childPrefix = nextBucketPrefix(prefix);
@@ -229,25 +227,24 @@ const state = {
   selectedHostId: null,
   filters: { search: "", status: "", newOnly: false, subnetId: "", risk: "", hideSuspect: false, priorityOnly: false, tagIds: new Set(), showHiddenSubnets: false },
   sortBy: "priority",
-  // Bucket keys expanded in either graph view — shared between the
-  // animated canvas and the static one, so expanding a bucket in one is
-  // reflected in the other.
+  // Bucket keys expanded in the graph (a subnet bigger than /24 groups its
+  // hosts into buckets — see Graph._layoutLevel — until clicked open).
   expandedBuckets: new Set(),
-  // Subnet keys collapsed in either graph view — inverse sense of
-  // expandedBuckets (subnets default to expanded, so this tracks the
-  // exception), but otherwise the same shared-between-both-views deal.
+  // Subnet keys collapsed in the graph — inverse sense of expandedBuckets
+  // (subnets default to expanded, so this tracks the exception).
   collapsedSubnets: new Set(),
   notifDismissed: new Set(), // event ids the user has cleared from the bell panel
   notifUnread: new Set(), // event ids not yet seen (drives the bell badge count)
   pendingTagAdds: [], // staged in the host modal until Save is clicked
   pendingTagRemoves: [],
-  // "graph" | "simple" — simple view swaps the physics-animated canvas for
-  // a second canvas showing the same segments > hosts hierarchy laid out
-  // as a static tree (deterministic positions, draw-on-demand instead of a
-  // continuous per-frame loop). For remote/thin-client sessions where that
-  // continuous redraw is heavy or laggy. Persisted per browser, not per
-  // account, since it's about the viewing hardware.
-  viewMode: localStorage.getItem("viewMode") === "simple" ? "simple" : "graph",
+  // "graph" | "table" — table view swaps the animated canvas out entirely
+  // for a searchable, expandable subnet/host table. Persisted per browser,
+  // not per account, since it's about viewing preference.
+  viewMode: localStorage.getItem("viewMode") === "table" ? "table" : "graph",
+  // Subnet ids expanded in the table view — independent of the graph's
+  // collapsedSubnets (opposite default: table rows start collapsed, so
+  // this tracks which ones the user opened, not which they closed).
+  tableExpandedSubnets: new Set(),
 };
 
 function subnetById(id) { return state.subnets.find((s) => s.id === id); }
@@ -264,15 +261,8 @@ class Graph {
   static ZOOM_MIN = 0.15;
   static ZOOM_MAX = 4;
 
-  /** animated (default true) picks the physics-simulated layout used by
-   * the main graph view. Passing false gives the simple-view graph: same
-   * node/link model, same pan/zoom/drag/click-to-expand interactions, but
-   * positions come from a one-shot deterministic tree layout (see
-   * _syncStatic) instead of a spring simulation, and wake() draws once on
-   * demand instead of starting a continuous requestAnimationFrame loop. */
-  constructor(canvas, opts = {}) {
+  constructor(canvas) {
     this.canvas = canvas;
-    this.animated = opts.animated !== false;
     this.ctx = canvas.getContext("2d");
     this.nodes = new Map(); // key -> node
     this.links = [];
@@ -417,23 +407,17 @@ class Graph {
     if (n) { n.pinned = false; this.wake(); }
   }
 
-  /** Animated: (re)starts the physics/redraw loop if it isn't already
-   * running. Static: there's no loop to start — every wake() is a single
-   * immediate redraw, since positions only ever change from an explicit
-   * sync()/drag/pan/zoom, never from a settling simulation. Either way,
-   * paused suppresses it completely: the point of the static view is that
-   * a client with weak video acceleration pays for a redraw only when
-   * something actually visibly changed, never on a timer. */
+  /** (Re)starts the physics/redraw loop if it isn't already running.
+   * paused suppresses it completely — see setPaused. */
   wake() {
     this._sleepFrames = 0;
     if (this.paused) return;
-    if (!this.animated) { this._draw(); return; }
     if (!this.running) { this.running = true; requestAnimationFrame(() => this._tick()); }
   }
 
   /** Pausing stops the physics/redraw loop outright — wake() becomes a
-   * no-op rather than just hiding the canvas — so whichever view isn't
-   * currently shown genuinely costs nothing, instead of continuing to
+   * no-op rather than just hiding the canvas — so table view (which shows
+   * neither this canvas) genuinely costs nothing, instead of continuing to
    * repaint an invisible element. Unpausing wakes it so the (possibly
    * stale, since sync() was still updating the node/link data underneath)
    * layout redraws immediately. */
@@ -493,12 +477,8 @@ class Graph {
   }
 
   /** Rebuild node/link set from current subnets+hosts, preserving positions
-   * of nodes that still exist. Static graphs use a completely different
-   * (non-physics) layout algorithm — see _syncStatic — since there's no
-   * simulation running to spread freshly-seeded nodes apart. */
+   * of nodes that still exist. */
   sync(subnets, hosts) {
-    if (!this.animated) { this._syncStatic(subnets, hosts); return; }
-
     const nextKeys = new Set();
     const cx = 0, cy = 0;
 
@@ -533,102 +513,6 @@ class Graph {
         this._layoutLevel(subnetKey, subnetHosts, cidrPrefix(sn.cidr), sn.id, nextKeys, cx, cy);
       }
     }
-
-    for (const key of Array.from(this.nodes.keys())) {
-      if (!nextKeys.has(key)) this.nodes.delete(key);
-    }
-
-    this.wake();
-  }
-
-  /** Builds a plain-object tree (subnet -> bucket* -> host) describing
-   * what should be visible under key given the current bucket-expansion
-   * state, with no canvas/positioning concerns mixed in — the static
-   * layout's equivalent of what _layoutLevel does while it recurses, but
-   * as a separate pass since the tree layout below needs the whole shape
-   * (to compute subtree widths) before it can place anything, unlike the
-   * physics layout which only needs a rough starting point per node.
-   * Subnets expand unless collapsed via state.collapsedSubnets; buckets
-   * expand only via the same state.expandedBuckets the animated view's
-   * bucket click-to-expand uses — both sets are shared between views. */
-  _buildLogicalTree(key, type, data, hosts, prefix, subnetId) {
-    const node = { key, type, data, subnetId, children: [] };
-    if (type === "host") return node;
-
-    node.count = hosts.length;
-    node.expanded = type === "subnet" ? !state.collapsedSubnets.has(key) : state.expandedBuckets.has(key);
-    if (node.expanded) {
-      const level = nextTreeLevel(hosts, prefix);
-      node.children = !level
-        ? hosts.map((h) => this._buildLogicalTree("host:" + h.id, "host", h, null, null, null))
-        : Array.from(level.groups.entries())
-          .sort((a, b) => a[0].localeCompare(b[0]))
-          .map(([cidr, groupHosts]) => this._buildLogicalTree(
-            "bucket:" + subnetId + ":" + cidr, "bucket", { cidr }, groupHosts, level.childPrefix, subnetId));
-    }
-    return node;
-  }
-
-  /** Static-view equivalent of sync(): lays out the same segments > hosts
-   * hierarchy as a top-down tree instead of a physics simulation. Depth
-   * comes straight from tree depth; horizontal position comes from a
-   * simple two-pass scheme — leaves get sequential slots left to right,
-   * each internal node centers over its children's slots — which is all
-   * that's needed since (unlike the animated view) nothing has to spread
-   * newly-added nodes apart after the fact. Positions are only assigned to
-   * brand-new nodes; anything the user already dragged keeps its place
-   * across re-syncs, same as pinning does in the animated view. */
-  _syncStatic(subnets, hosts) {
-    const bySubnet = new Map();
-    hosts.forEach((h) => {
-      if (!bySubnet.has(h.subnetId)) bySubnet.set(h.subnetId, []);
-      bySubnet.get(h.subnetId).push(h);
-    });
-
-    const roots = subnets.map((sn) => this._buildLogicalTree(
-      "subnet:" + sn.id, "subnet", sn, bySubnet.get(sn.id) || [], cidrPrefix(sn.cidr), sn.id));
-
-    const leafCounter = { n: 0 };
-    const assignSlots = (node, depth) => {
-      node.depth = depth;
-      if (node.children.length === 0) {
-        node.tx = leafCounter.n++;
-        return;
-      }
-      node.children.forEach((c) => assignSlots(c, depth + 1));
-      const txs = node.children.map((c) => c.tx);
-      node.tx = (Math.min(...txs) + Math.max(...txs)) / 2;
-    };
-    roots.forEach((root) => assignSlots(root, 0));
-
-    const spacingX = 70, spacingY = 90;
-    const offsetX = -Math.max(0, (leafCounter.n - 1) * spacingX) / 2;
-
-    const nextKeys = new Set();
-    const place = (node, parentKey) => {
-      nextKeys.add(node.key);
-      const r = node.type === "subnet" ? 16 : node.type === "bucket" ? 14 : 7;
-      const cn = this._ensureNode(node.key, () => ({
-        key: node.key, type: node.type, r, vx: 0, vy: 0, pinned: false,
-        hostId: node.type === "host" ? node.data.id : undefined,
-        x: node.tx * spacingX + offsetX, y: node.depth * spacingY,
-      }));
-      cn.data = node.data;
-      if (node.type === "bucket") {
-        cn.subnetId = node.subnetId;
-        cn.cidr = node.data.cidr;
-        cn.count = node.count;
-        cn.expanded = node.expanded;
-      } else if (node.type === "subnet") {
-        cn.count = node.count;
-        cn.expanded = node.expanded;
-      }
-      if (parentKey) this.links.push({ a: parentKey, b: node.key });
-      node.children.forEach((c) => place(c, node.key));
-    };
-
-    this.links = [];
-    roots.forEach((root) => place(root, null));
 
     for (const key of Array.from(this.nodes.keys())) {
       if (!nextKeys.has(key)) this.nodes.delete(key);
@@ -869,8 +753,7 @@ class Graph {
   }
 }
 
-let graph; // animated, physics-simulated
-let simpleGraph; // static tree layout, for simple view
+let graph;
 
 /* ---------------------------------------------------------------------- */
 /* rendering                                                              */
@@ -1105,6 +988,86 @@ function renderSubnetList() {
   }
 }
 
+function toggleTableSubnet(id) {
+  if (state.tableExpandedSubnets.has(id)) state.tableExpandedSubnets.delete(id);
+  else state.tableExpandedSubnets.add(id);
+  renderTableView();
+}
+
+/** The data cells for one host — Status, IP, Hostname, Open ports, Flags,
+ * Last seen — used by a subnet's expanded sub-rows (hostSubRow). Subnet
+ * itself is omitted since hostSubRow's parent row already says which
+ * subnet it is. */
+function hostRowCells(h) {
+  const openPorts = (h.ports || []).filter((p) => p.state === "open").map((p) => p.port).sort((a, b) => a - b);
+  return [
+    el("td", {}, [el("span", { class: "status-dot", style: `background:${statusColorVar(h.status)}` }), " " + statusLabel(h.status)]),
+    el("td", { class: "host-ip" }, [h.ip]),
+    el("td", {}, [h.hostname || "—"]),
+    el("td", {}, [openPorts.length ? openPorts.join(", ") : "—"]),
+    el("td", {}, [
+      h.riskLevel ? riskBadge(h.riskLevel, h.riskReasons, h.acknowledged) : null,
+      h.suspect ? el("span", { class: "badge-suspect", title: h.suspectReason, text: "SUSPECT" }) : null,
+      h.isNew ? el("span", { class: "badge-new", text: "NEW" }) : null,
+    ]),
+    el("td", { class: "muted small" }, [timeAgo(h.lastSeen)]),
+  ];
+}
+
+/** One host, nested under its expanded subnet row in the subnets table.
+ * Deliberately shows every host in the subnet regardless of the table's
+ * own search/subnet filter — expanding a specific subnet is a direct
+ * request to see everything in it, not something a stale search term
+ * should be able to empty out. */
+function hostSubRow(h) {
+  return el("tr", { class: "host-subrow", onclick: () => openHostModal(h.id) }, [
+    el("td", {}, []),
+    ...hostRowCells(h),
+  ]);
+}
+
+/** Subnets table: one row per subnet with a live up/down/unconfirmed
+ * breakdown, click to expand its hosts inline (see hostSubRow) — the
+ * "table view of subnets, which can then be expanded into hosts" half of
+ * table view. */
+function renderSubnetsTable() {
+  const tbody = qs("#subnetsTableBody");
+  if (!tbody) return;
+  tbody.innerHTML = "";
+  if (state.subnets.length === 0) {
+    tbody.appendChild(el("tr", {}, [el("td", { colspan: "7", class: "muted small", style: "padding:16px;" }, ["No subnets yet."])]));
+    return;
+  }
+  for (const sn of state.subnets) {
+    const snHosts = state.hosts.filter((h) => h.subnetId === sn.id);
+    const up = snHosts.filter((h) => h.status === "up").length;
+    const down = snHosts.filter((h) => h.status === "down").length;
+    const unknown = snHosts.filter((h) => h.status === "unknown").length;
+    const expanded = state.tableExpandedSubnets.has(sn.id);
+    tbody.appendChild(el("tr", { class: "subnet-row" + (sn.hidden ? " subnet-row-hidden" : ""), onclick: () => toggleTableSubnet(sn.id) }, [
+      el("td", { class: "expand-cell" }, [expanded ? "▾" : "▸"]),
+      el("td", {}, [subnetDisplayLabel(sn), sn.hidden ? el("span", { class: "badge-suspect", text: "HIDDEN" }) : null]),
+      el("td", {}, [String(snHosts.length)]),
+      el("td", {}, [String(up)]),
+      el("td", {}, [String(down)]),
+      el("td", {}, [String(unknown)]),
+      el("td", { class: "muted small" }, [timeAgo(sn.lastScanAt)]),
+    ]));
+    if (!expanded) continue;
+    if (snHosts.length === 0) {
+      tbody.appendChild(el("tr", { class: "host-subrow" }, [el("td", {}, []), el("td", { colspan: "6", class: "muted small" }, ["No hosts in this subnet."])]));
+    } else {
+      for (const h of snHosts.slice().sort((a, b) => a.ip.localeCompare(b.ip, undefined, { numeric: true }))) {
+        tbody.appendChild(hostSubRow(h));
+      }
+    }
+  }
+}
+
+function renderTableView() {
+  renderSubnetsTable();
+}
+
 function renderTagSelects() {
   const modalSelect = qs("#hamSubnet");
   modalSelect.innerHTML = "";
@@ -1156,7 +1119,7 @@ function renderSubnetFilterOptions() {
 function renderGraph() {
   const subnets = graphSubnets(), hosts = filteredHosts();
   if (graph) graph.sync(subnets, hosts);
-  if (simpleGraph) simpleGraph.sync(subnets, hosts);
+  renderTableView();
 }
 
 function renderAll() {
@@ -1733,43 +1696,64 @@ function wireGraphControls() {
   });
 }
 
-/** Applies state.viewMode to the layout and to which of the two Graph
- * instances is actively rendering. Pausing the hidden one (rather than
- * just hiding it with CSS) is the point of simple view: whichever graph
- * isn't shown stops doing any per-frame or on-demand canvas work outright,
- * instead of continuing to repaint an element the user can't see. */
-function applyViewMode() {
-  const simple = state.viewMode === "simple";
-  qs("#layout").classList.toggle("simple-view", simple);
-  const btn = qs("#btnViewToggle");
-  btn.textContent = simple ? "Graph view" : "Simple view";
-  btn.setAttribute("aria-pressed", String(simple));
+const VIEW_LABELS = { graph: "Graph", table: "Table" };
 
-  const shown = simple ? simpleGraph : graph;
-  const hidden = simple ? graph : simpleGraph;
-  if (hidden) hidden.setPaused(true);
-  if (shown) {
-    // Its canvas was display:none while hidden, so its rect (and anything
-    // sized from it) may be stale or zero; recompute before unpausing so
-    // switching to it doesn't briefly draw into a zero-sized canvas.
-    shown._resize();
-    shown.setPaused(false);
+/** Applies state.viewMode to the layout and to whether the graph is
+ * actively rendering. Pausing it (rather than just hiding it with CSS) is
+ * the point in table view: the canvas stops doing any per-frame work
+ * outright, instead of continuing to repaint an element the user can't
+ * see. */
+function applyViewMode() {
+  const mode = state.viewMode;
+  const layout = qs("#layout");
+  layout.classList.toggle("table-view", mode === "table");
+
+  qs("#btnViewMenuToggle").textContent = `View: ${VIEW_LABELS[mode]} ▾`;
+  for (const btn of qsa("#viewMenu .account-menu-item")) {
+    btn.classList.toggle("active", btn.dataset.view === mode);
   }
+
+  if (graph) {
+    if (mode === "table") {
+      graph.setPaused(true);
+    } else {
+      // Its canvas was display:none while hidden, so its rect (and
+      // anything sized from it) may be stale or zero; recompute before
+      // unpausing so switching to it doesn't briefly draw into a
+      // zero-sized canvas.
+      graph._resize();
+      graph.setPaused(false);
+    }
+  }
+  if (mode === "table") renderTableView();
 }
 
 function wireViewToggle() {
-  qs("#btnViewToggle").addEventListener("click", () => {
-    state.viewMode = state.viewMode === "simple" ? "graph" : "simple";
-    localStorage.setItem("viewMode", state.viewMode);
-    applyViewMode();
+  const menu = registerDropdownPanel(qs("#viewMenu"));
+  qs("#btnViewMenuToggle").addEventListener("click", (e) => {
+    e.stopPropagation();
+    const opening = menu.hidden;
+    closeDropdownPanels(menu);
+    menu.hidden = !opening;
   });
+  menu.addEventListener("click", (e) => e.stopPropagation());
+  document.addEventListener("click", () => { menu.hidden = true; });
+
+  for (const btn of qsa("#viewMenu .account-menu-item")) {
+    btn.addEventListener("click", () => {
+      state.viewMode = btn.dataset.view;
+      localStorage.setItem("viewMode", state.viewMode);
+      menu.hidden = true;
+      applyViewMode();
+    });
+  }
 }
 
-/** Whichever of the two Graph instances (animated vs. simple-view) is
- * currently visible — what the +/- zoom buttons and any other
- * view-agnostic graph control should act on. */
+/** The graph, when it's the visible view — what the +/- zoom buttons and
+ * any other view-agnostic graph control should act on. null in table
+ * view, where the canvas isn't shown. */
 function activeGraph() {
-  return state.viewMode === "simple" ? simpleGraph : graph;
+  return state.viewMode === "table" ? null : graph;
 }
 
 /** +/- zoom buttons: an explicit, clickable alternative to scroll-to-zoom
@@ -3045,7 +3029,6 @@ async function startApp() {
   appStarted = true;
 
   graph = new Graph(qs("#graph"));
-  simpleGraph = new Graph(qs("#simpleGraph"), { animated: false });
   applyViewMode();
   wireTabs();
   wireGraphControls();

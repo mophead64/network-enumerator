@@ -69,7 +69,13 @@
           <button id="btnScanReverseDns" class="account-menu-item" title="Sweep every address for a PTR record (dnsrecon if installed, else dig -x), independent of ping/TCP/ARP discovery">Reverse DNS scan…</button>
         </div>
       </div>
-      <button id="btnViewToggle" class="btn" title="Switch between the animated graph and a static expand/collapse tree — same segments-and-hosts view, no canvas animation, easier on remote sessions with poor video acceleration" aria-pressed="false">Simple view</button>
+      <div class="notif-wrap">
+        <button id="btnViewMenuToggle" class="btn" aria-haspopup="true">View: Graph ▾</button>
+        <div id="viewMenu" class="notif-panel account-menu" hidden>
+          <button id="btnViewGraph" class="account-menu-item" data-view="graph" title="Animated, physics-simulated graph of subnets and hosts">Graph view</button>
+          <button id="btnViewTable" class="account-menu-item" data-view="table" title="Subnets and hosts as searchable tables — expand a subnet row to see its hosts">Table view</button>
+        </div>
+      </div>
       <button id="btnAddSubnet" class="btn">+ Subnet</button>
       <button id="btnAddHost" class="btn">+ Host</button>
       <button id="btnTags" class="btn">Tags</button>
@@ -123,7 +129,6 @@
   <main class="layout" id="layout">
     <section class="graph-pane">
       <canvas id="graph"></canvas>
-      <canvas id="simpleGraph"></canvas>
       <div class="graph-overlay">
         <div class="legend">
           <div class="legend-row"><span class="swatch status-good"></span>up</div>
@@ -143,6 +148,18 @@
       <div id="emptyState" class="empty-state" hidden>
         <p>No hosts discovered yet.</p>
         <p class="muted small">The scanner runs automatically. You can also add a subnet or host manually, or trigger a scan now.</p>
+      </div>
+    </section>
+
+    <section class="table-view-pane" id="tableViewPane">
+      <div class="table-view-scroll">
+        <h3 class="table-view-heading">Subnets <span class="muted small">— click a row to expand its hosts</span></h3>
+        <table class="data-table" id="subnetsTable">
+          <thead>
+            <tr><th></th><th>Subnet</th><th>Hosts</th><th>Up</th><th>Down</th><th>Unconfirmed</th><th>Last scanned</th></tr>
+          </thead>
+          <tbody id="subnetsTableBody"></tbody>
+        </table>
       </div>
     </section>
 
