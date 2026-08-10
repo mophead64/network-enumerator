@@ -91,14 +91,26 @@ func RunNmap(ctx context.Context, path string, targets []string, ports []int, ho
 		return nil, fmt.Errorf("nmap: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
 
+	return ParseNmapXML(stdout.Bytes())
+}
+
+// ParseNmapXML parses nmap's (or a compatible tool's, e.g. masscan's) -oX
+// output into the same NmapHost shape RunNmap returns — shared by RunNmap's
+// live output and by importing a scan someone ran outside this app (see
+// api.importNmapXML). A host is skipped only when explicitly marked down
+// (real nmap output always states "up" or "down"); masscan's XML omits
+// <status> entirely for every host it emits, since it only ever records
+// addresses that answered, so a missing state is treated as up rather than
+// silently discarding every host in the file.
+func ParseNmapXML(data []byte) ([]NmapHost, error) {
 	var run nmapXMLRun
-	if err := xml.Unmarshal(stdout.Bytes(), &run); err != nil {
+	if err := xml.Unmarshal(data, &run); err != nil {
 		return nil, fmt.Errorf("parse nmap output: %w", err)
 	}
 
 	hosts := make([]NmapHost, 0, len(run.Hosts))
 	for _, h := range run.Hosts {
-		if h.Status.State != "up" {
+		if h.Status.State == "down" {
 			continue
 		}
 		var nh NmapHost

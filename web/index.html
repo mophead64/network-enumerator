@@ -92,10 +92,12 @@
         <div id="importMenu" class="notif-panel account-menu" hidden>
           <button id="btnImportNetworkMap" class="account-menu-item" title="Restore subnets, hosts, and open ports from a previously exported network map JSON file">Network map (JSON)…</button>
           <button id="btnImportDnsRecon" class="account-menu-item" title="Enrich hosts with hostnames from a dnsrecon -j JSON scan; adds subnets/hosts that don't exist yet">DNS recon scan (JSON)…</button>
+          <button id="btnImportNmap" class="account-menu-item" title="Import hosts and open ports from an nmap or masscan -oX XML scan; adds subnets/hosts that don't exist yet">Nmap/masscan scan (XML)…</button>
         </div>
       </div>
       <input id="importNetworkMapFileInput" type="file" accept="application/json,.json" hidden>
       <input id="importDnsReconFileInput" type="file" accept="application/json,.json" hidden>
+      <input id="importNmapFileInput" type="file" accept="text/xml,application/xml,.xml" hidden>
       <div class="notif-wrap">
         <button id="btnNotifs" class="btn-icon notif-bell" title="Notifications" aria-label="Notifications">
           🔔<span id="notifBadge" class="notif-badge" hidden>0</span>

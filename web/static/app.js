@@ -188,6 +188,24 @@ const Api = {
 
   importNetworkMap: (doc) => Api._req("POST", "/api/import/network-map", doc),
   importDnsRecon: (records) => Api._req("POST", "/api/import/dnsrecon", records),
+  // Raw XML, not JSON — bypasses _req's JSON.stringify/Content-Type: application/json.
+  importNmapXml: async (xmlText) => {
+    const res = await fetch("/api/import/nmap", {
+      method: "POST",
+      headers: { "Content-Type": "text/xml" },
+      body: xmlText,
+    });
+    if (res.status === 401 && !AUTH_EXEMPT_PATHS.has("/api/import/nmap")) {
+      if (!suppressSessionExpiry) showLoginScreen();
+      throw new Error("Session expired — please sign in again.");
+    }
+    if (!res.ok) {
+      let msg = res.statusText;
+      try { msg = (await res.json()).error || msg; } catch (_) { /* ignore */ }
+      throw new Error(msg);
+    }
+    return res.json();
+  },
 
   events: () => Api._req("GET", "/api/events"),
   toolStatus: () => Api._req("GET", "/api/tools/status"),
@@ -1784,6 +1802,19 @@ async function runImport(file, apiFn, summarizeFn) {
   }
 }
 
+// Like runImport, but for formats that aren't JSON (nmap/masscan XML) — reads
+// the file as raw text instead of parsing it client-side and hands it
+// straight to apiFn.
+async function runImportText(file, apiFn, summarizeFn) {
+  try {
+    const result = await apiFn(await file.text());
+    await refreshHostsAndSubnets();
+    toast(summarizeFn(result));
+  } catch (err) {
+    toast(`Import failed: ${err.message}`, "bad");
+  }
+}
+
 /** Builds a segments/hosts/ports export document (same snake_case schema as
  * the server's /api/export/network-map, see exportNetworkMap in
  * internal/api/export.go) from a client-side host list, so "Export
@@ -2081,7 +2112,7 @@ function wireExport() {
   });
 }
 
-/** Two import flows share one dropdown menu, mirroring the "Scan now ▾"
+/** Three import flows share one dropdown menu, mirroring the "Scan now ▾"
  * menu right next to it:
  *  - Network map (JSON): restores subnets/hosts/open-ports from a network
  *    map previously downloaded via "Export JSON" — mainly for a fresh run
@@ -2090,8 +2121,11 @@ function wireExport() {
  *  - DNS recon scan (JSON): enriches hosts with hostnames from a dnsrecon
  *    -j scan run outside this app, creating subnets/hosts that don't exist
  *    yet.
- * Both are additive: re-importing, or importing on top of a database that
- * already has scan data, only ever fills in gaps. */
+ *  - Nmap/masscan scan (XML): imports hosts and open ports from an -oX scan
+ *    run outside this app (nmap or masscan — both use the same schema),
+ *    creating subnets/hosts that don't exist yet.
+ * All three are additive: re-importing, or importing on top of a database
+ * that already has scan data, only ever fills in gaps. */
 function wireImport() {
   const importMenu = registerDropdownPanel(qs("#importMenu"));
   qs("#btnImportMenuToggle").addEventListener("click", (e) => {
@@ -2103,7 +2137,7 @@ function wireImport() {
   importMenu.addEventListener("click", (e) => e.stopPropagation());
   document.addEventListener("click", () => { importMenu.hidden = true; });
 
-  const wireImportItem = (buttonId, fileInputId, apiFn, summarizeFn) => {
+  const wireImportItem = (buttonId, fileInputId, apiFn, summarizeFn, runFn = runImport) => {
     const fileInput = qs(fileInputId);
     qs(buttonId).addEventListener("click", () => {
       importMenu.hidden = true;
@@ -2112,7 +2146,7 @@ function wireImport() {
     fileInput.addEventListener("change", async () => {
       const file = fileInput.files[0];
       fileInput.value = ""; // so picking the same file again still fires "change"
-      if (file) await runImport(file, apiFn, summarizeFn);
+      if (file) await runFn(file, apiFn, summarizeFn);
     });
   };
 
@@ -2120,6 +2154,9 @@ function wireImport() {
     (r) => `Imported ${r.segments} segment(s), ${r.hosts} host(s) (${r.newHosts} new), ${r.newPorts} new open port(s).`);
   wireImportItem("#btnImportDnsRecon", "#importDnsReconFileInput", Api.importDnsRecon,
     (r) => `Imported dnsrecon scan: ${r.addresses} address(es), ${r.newSubnets} new subnet(s), ${r.newHosts} new host(s).`);
+  wireImportItem("#btnImportNmap", "#importNmapFileInput", Api.importNmapXml,
+    (r) => `Imported nmap scan: ${r.hosts} host(s) (${r.newSubnets} new subnet(s), ${r.newHosts} new), ${r.newPorts} new open port(s).`,
+    runImportText);
 }
 
 function wireTopbar() {

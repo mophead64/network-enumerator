@@ -76,6 +76,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/export/network-map", auth(s.exportNetworkMap))
 	mux.HandleFunc("POST /api/import/network-map", auth(s.importNetworkMap))
 	mux.HandleFunc("POST /api/import/dnsrecon", auth(s.importDNSRecon))
+	mux.HandleFunc("POST /api/import/nmap", auth(s.importNmapXML))
 
 	mux.HandleFunc("GET /api/events", auth(s.listEvents))
 	mux.HandleFunc("GET /api/events/stream", auth(s.hub.ServeHTTP))
