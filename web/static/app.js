@@ -2009,6 +2009,35 @@ function mermaidStatusClass(status) {
   return "statusUp";
 }
 
+/** Fill/stroke/font trio per status class, shared by both diagram exports —
+ * buildMermaidDiagram's classDef lines and buildDrawioDiagram's native node
+ * styles — so a host's status maps to the same color everywhere. "down" is
+ * yellow rather than red: red reads as "this needs urgent action" for a
+ * pentest audience, when a non-responding host is routine and expected.
+ * Yellow's fill is light enough that it needs a dark font color, unlike
+ * the other two statuses' white text on a dark fill. */
+const STATUS_FILL = {
+  statusUp: { fill: "#0ca30c", stroke: "#087a08", font: "#ffffff" },
+  statusDown: { fill: "#e6b800", stroke: "#a37f00", font: "#3d2e00" },
+  statusUnknown: { fill: "#898781", stroke: "#5f5d59", font: "#ffffff" },
+};
+
+/** Number of columns for a roughly-square grid of n items — ceil(sqrt(n)),
+ * so hosts within a subnet square off (4→2x2, 5→3+2, 6→3x3) instead of
+ * forming one long row or column. Shared by buildMermaidDiagram (nested
+ * row subgraphs) and buildDrawioDiagram (a literal x/y grid). */
+function gridColumns(n) {
+  return Math.max(1, Math.ceil(Math.sqrt(n)));
+}
+
+/** Splits items into row-major chunks of `cols` — the last row gets
+ * whatever's left over (e.g. 5 items at 3 cols → rows of [3, 2]). */
+function gridRows(items, cols) {
+  const rows = [];
+  for (let i = 0; i < items.length; i += cols) rows.push(items.slice(i, i + cols));
+  return rows;
+}
+
 /** One host node's label: IP, then hostname (via <br/>) when present,
  * prefixed with a warning marker for an unacknowledged priority host — the
  * same "priority" definition priorityReportHosts uses. Ports are
@@ -2056,12 +2085,11 @@ function mermaidTableCell(s) {
     .trim() || "—";
 }
 
-/** Mermaid has no dedicated "table" diagram type, but its flowchart renderer
- * accepts raw HTML inside a quoted node label (htmlLabels is on by
- * default) — so a single node whose label is one big <table> renders as an
- * actual table. This builds that node: one row per host across every
- * subnet, sorted the same way the diagram's host nodes are. */
-function mermaidPortsTableLines(subnets, hosts) {
+/** Builds the "Hosts & Open Ports" HTML table shared by both diagram
+ * exports (mermaidPortsTableLines below, and buildDrawioDiagram's native
+ * table node) — one row per host across every subnet, sorted the same way
+ * each diagram's host nodes are. */
+function buildHostPortsTableHtml(subnets, hosts) {
   const bySubnet = new Map();
   for (const h of hosts) {
     if (!bySubnet.has(h.subnetId)) bySubnet.set(h.subnetId, []);
@@ -2089,9 +2117,17 @@ function mermaidPortsTableLines(subnets, hosts) {
     }
   }
 
+  return `<table>${rows.join("")}</table>`;
+}
+
+/** Mermaid has no dedicated "table" diagram type, but its flowchart renderer
+ * accepts raw HTML inside a quoted node label (htmlLabels is on by
+ * default) — so a single node whose label is one big <table> renders as an
+ * actual table. */
+function mermaidPortsTableLines(subnets, hosts) {
   return [
     '  subgraph PORTS["Hosts & Open Ports"]',
-    `    portsTable["<table>${rows.join("")}</table>"]`,
+    `    portsTable["${buildHostPortsTableHtml(subnets, hosts)}"]`,
     "  end",
   ];
 }
@@ -2113,9 +2149,8 @@ function buildMermaidDiagram(subnets, hosts) {
 
   const lines = [
     "flowchart LR",
-    "classDef statusUp fill:#0ca30c,stroke:#087a08,color:#fff;",
-    "classDef statusDown fill:#d03b3b,stroke:#9c2323,color:#fff;",
-    "classDef statusUnknown fill:#898781,stroke:#5f5d59,color:#fff;",
+    ...Object.entries(STATUS_FILL).map(([cls, c]) => `classDef ${cls} fill:${c.fill},stroke:${c.stroke},color:${c.font};`),
+    "classDef gridRow fill:none,stroke:none;",
     ...mermaidLegendLines(),
   ];
 
@@ -2126,16 +2161,39 @@ function buildMermaidDiagram(subnets, hosts) {
     if (snHosts.length === 0) {
       lines.push(`    seg${sn.id}empty["no hosts"]`);
     } else {
-      for (const h of snHosts) {
-        lines.push(`    host${h.id}["${mermaidHostLabel(h)}"]:::${mermaidStatusClass(h.status)}`);
+      // Each row is its own nested subgraph so hosts square off into a
+      // grid instead of one long column: gridRows splits snHosts into
+      // roughly-sqrt(n)-wide rows, each row gets "direction LR" so its
+      // hosts sit side by side, and an invisible link (~~~) between the
+      // hosts in a row is what actually forces that — same reason (and
+      // same fix) the subnet-to-subnet chain below exists. The row
+      // subgraphs themselves are disconnected from each other, so they
+      // also need chaining to stack top to bottom under "direction TB".
+      const rows = gridRows(snHosts, gridColumns(snHosts.length));
+      rows.forEach((row, ri) => {
+        lines.push(`    subgraph seg${sn.id}row${ri}[" "]:::gridRow`);
+        lines.push("      direction LR");
+        for (const h of row) {
+          lines.push(`      host${h.id}["${mermaidHostLabel(h)}"]:::${mermaidStatusClass(h.status)}`);
+        }
+        if (row.length > 1) lines.push(`      ${row.map((h) => `host${h.id}`).join(" ~~~ ")}`);
+        lines.push("    end");
+      });
+      if (rows.length > 1) {
+        lines.push(`    ${rows.map((_, ri) => `seg${sn.id}row${ri}`).join(" ~~~ ")}`);
       }
-      // Host nodes have no real edges between them, so without this chain
-      // Mermaid's layout engine free-arranges them into a grid rather than
-      // honoring "direction TB" above — an invisible link (~~~) between
-      // each consecutive pair is what actually forces the vertical stack.
-      lines.push(`    ${snHosts.map((h) => `host${h.id}`).join(" ~~~ ")}`);
     }
     lines.push("  end");
+  }
+
+  // Subgraphs aren't connected to each other by anything, so the layout
+  // engine treats each subnet as its own disconnected component and stacks
+  // them top-to-bottom regardless of the top-level "LR" direction — the
+  // same reason host nodes need chaining above. An invisible link between
+  // consecutive subgraphs is what actually forces subnets to line up
+  // side-by-side.
+  if (subnets.length > 1) {
+    lines.push(`  ${subnets.map((sn) => `seg${sn.id}`).join(" ~~~ ")}`);
   }
 
   lines.push(...mermaidPortsTableLines(subnets, hosts));
@@ -2154,6 +2212,197 @@ function downloadMermaidDiagram() {
   downloadBlob(new Blob([buildMermaidDiagram(subnets, hosts)], { type: "text/plain" }), `network-map-${exportTimestamp()}.mmd`);
 }
 
+/** Escapes a value for an XML attribute in the draw.io export — & < > "
+ * need entity-escaping same as any XML attribute, and a literal newline
+ * needs the numeric reference &#10; since XML attribute-value
+ * normalization would otherwise flatten it to a space. */
+function drawioAttr(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+    .replace(/\n/g, "&#10;");
+}
+
+/** One host node's label for the draw.io export — same content as
+ * mermaidHostLabel (IP, then hostname, prefixed with a warning marker for
+ * an unacknowledged priority host) but plain-text lines instead of <br/>,
+ * since draw.io node values aren't HTML unless the node's style says so. */
+function drawioHostLabel(h) {
+  const lines = [h.ip];
+  if (h.hostname) lines.push(h.hostname);
+  const prefix = h.riskLevel && !h.acknowledged ? "⚠ " : "";
+  return prefix + lines.join("\n");
+}
+
+/** draw.io's built-in "Network" stencil set (stencils/networks.xml, ships
+ * with no import/library step needed) has no generic "Server" or
+ * "Workstation" pictogram — only specific ones. "Mail Server" and "PC" are
+ * the closest visual stand-ins (a generic server-chassis glyph and a
+ * generic desktop-computer glyph respectively); "Router" is a direct hit. */
+const HOST_KIND_SHAPE = {
+  router: "mxgraph.networks.router",
+  server: "mxgraph.networks.mail_server",
+  workstation: "mxgraph.networks.pc",
+};
+
+/** The app has no explicit "role" field for a host, so the draw.io export
+ * guesses one from cheap signals: a .1 (or named rtr/router/gw/gateway/fw)
+ * address is almost always a gateway; a host with a classic server-side
+ * port open (web/mail/dns/db/directory, as opposed to the Windows
+ * admin/RPC ports every workstation in this app's scans tends to expose)
+ * is a server; anything else defaults to a workstation. It's a heuristic,
+ * not ground truth — good enough for an icon, not for a security finding. */
+function inferHostKind(h) {
+  const lastOctet = Number(h.ip.split(".").pop());
+  const name = (h.hostname || "").toLowerCase();
+  if (lastOctet === 1 || /(^|[-_.])(rtr|router|gw|gateway|fw|firewall)([-_.]|$)/.test(name)) return "router";
+  const SERVER_PORTS = new Set([21, 25, 53, 80, 110, 143, 389, 443, 636, 993, 995, 1433, 1521, 3306, 5432, 8080, 8443]);
+  const hasServerPort = (h.ports || []).some((p) => p.state === "open" && SERVER_PORTS.has(p.port));
+  return hasServerPort ? "server" : "workstation";
+}
+
+/** Builds a single native draw.io (.drawio) file: a status legend and an
+ * icon-key legend, subnets as labeled boxes with hosts arranged in a
+ * roughly-square grid inside (see gridColumns/gridRows — same layout
+ * buildMermaidDiagram produces), each host drawn as a router/server/
+ * workstation icon (see inferHostKind) tinted by status, and a table node
+ * listing every host's open ports. Unlike the Mermaid export, draw.io
+ * opens this directly with no import step — so layout is computed here
+ * with a fixed grid rather than relying on draw.io's own Mermaid-import
+ * layout engine. */
+function buildDrawioDiagram(subnets, hosts) {
+  const bySubnet = new Map();
+  for (const h of hosts) {
+    if (!bySubnet.has(h.subnetId)) bySubnet.set(h.subnetId, []);
+    bySubnet.get(h.subnetId).push(h);
+  }
+
+  // 60x44 is a compromise box: close to "PC"/"Mail Server"'s native aspect
+  // (100x70, 103x107) without either dominating; "Router" (100x29) still
+  // renders a bit taller than its native aspect, but recognizable.
+  const ICON_W = 60, ICON_H = 44, LABEL_H = 30, CELL_W = 150, CELL_GAP_X = 20, CELL_GAP_Y = 15;
+  const CELL_H = ICON_H + LABEL_H;
+  const PAD = 20, TITLE_H = 30, SUBNET_GAP_X = 40;
+  const CONTAINER_STYLE = "rounded=0;whiteSpace=wrap;html=1;verticalAlign=top;fillColor=#f5f5f5;strokeColor=#666666;fontStyle=1;fontSize=14;";
+  const iconStyle = (shape, fill, stroke, font) =>
+    `shape=${shape};html=1;fillColor=${fill};strokeColor=${stroke};fontColor=${font};` +
+    "verticalLabelPosition=bottom;verticalAlign=top;align=center;fontSize=11;outlineConnect=0;";
+
+  let idCounter = 2;
+  const cells = [];
+  const addNode = (value, style, x, y, w, h) => {
+    const id = `n${idCounter++}`;
+    cells.push(
+      `        <mxCell id="${id}" value="${drawioAttr(value)}" style="${drawioAttr(style)}" vertex="1" parent="1">` +
+        `<mxGeometry x="${x}" y="${y}" width="${w}" height="${h}" as="geometry" /></mxCell>`,
+    );
+    return id;
+  };
+
+  // ---- Legends: status color, and icon-shape key ----
+  const LEGEND_W = 380, SWATCH_H = 40, SWATCH_GAP = 10;
+  const legendEntries = [
+    ["statusUp", "Up — confirmed live"],
+    ["statusDown", "Down — not responding"],
+    ["statusUnknown", "Unconfirmed — PTR only, no open port"],
+  ];
+  const legendH = TITLE_H + PAD + legendEntries.length * SWATCH_H + (legendEntries.length - 1) * SWATCH_GAP + PAD;
+  addNode("Legend", CONTAINER_STYLE, PAD, PAD, LEGEND_W, legendH);
+  legendEntries.forEach(([cls, label], i) => {
+    const c = STATUS_FILL[cls];
+    addNode(
+      label,
+      `whiteSpace=wrap;html=1;strokeWidth=1;fillColor=${c.fill};strokeColor=${c.stroke};fontColor=${c.font};fontSize=12;`,
+      PAD * 2, PAD + TITLE_H + PAD + i * (SWATCH_H + SWATCH_GAP), LEGEND_W - PAD * 2, SWATCH_H,
+    );
+  });
+
+  const kindLegendX = PAD + LEGEND_W + 40;
+  const kindLegendCellW = 110;
+  const kindEntries = [["router", "Router"], ["server", "Server"], ["workstation", "Workstation"]];
+  const kindLegendW = kindEntries.length * kindLegendCellW + PAD * 2;
+  const kindLegendH = TITLE_H + PAD + ICON_H + LABEL_H + PAD;
+  addNode("Icons", CONTAINER_STYLE, kindLegendX, PAD, kindLegendW, kindLegendH);
+  kindEntries.forEach(([kind, label], i) => {
+    addNode(
+      label,
+      iconStyle(HOST_KIND_SHAPE[kind], "#dae8fc", "#6c8ebf", "#333333"),
+      kindLegendX + PAD + i * kindLegendCellW + (kindLegendCellW - ICON_W) / 2, PAD + TITLE_H + PAD, ICON_W, ICON_H,
+    );
+  });
+
+  // ---- Subnets: left-to-right, hosts in a roughly-square grid within each ----
+  const subnetRowY = PAD + Math.max(legendH, kindLegendH) + 40;
+  let x = PAD;
+  let maxSubnetH = 0;
+  for (const sn of subnets) {
+    const snHosts = (bySubnet.get(sn.id) || []).slice().sort((a, b) => a.ip.localeCompare(b.ip, undefined, { numeric: true }));
+    const cols = gridColumns(snHosts.length || 1);
+    const rows = Math.max(Math.ceil(snHosts.length / cols), 1);
+    const subnetW = cols * CELL_W + (cols - 1) * CELL_GAP_X + PAD * 2;
+    const subnetH = TITLE_H + PAD + rows * CELL_H + (rows - 1) * CELL_GAP_Y + PAD;
+    maxSubnetH = Math.max(maxSubnetH, subnetH);
+    addNode(subnetDisplayLabel(sn), CONTAINER_STYLE, x, subnetRowY, subnetW, subnetH);
+    if (snHosts.length === 0) {
+      addNode(
+        "no hosts",
+        "whiteSpace=wrap;html=1;strokeWidth=1;fillColor=#ffffff;strokeColor=#999999;fontColor=#666666;fontSize=12;fontStyle=2;",
+        x + PAD, subnetRowY + TITLE_H + PAD, CELL_W, ICON_H,
+      );
+    } else {
+      snHosts.forEach((h, i) => {
+        const col = i % cols;
+        const row = Math.floor(i / cols);
+        const c = STATUS_FILL[mermaidStatusClass(h.status)];
+        const cellX = x + PAD + col * (CELL_W + CELL_GAP_X);
+        const cellY = subnetRowY + TITLE_H + PAD + row * (CELL_H + CELL_GAP_Y);
+        addNode(
+          drawioHostLabel(h),
+          iconStyle(HOST_KIND_SHAPE[inferHostKind(h)], c.fill, c.stroke, "#333333"),
+          cellX + (CELL_W - ICON_W) / 2, cellY, ICON_W, ICON_H,
+        );
+      });
+    }
+    x += subnetW + SUBNET_GAP_X;
+  }
+
+  // ---- Ports table ----
+  const tableY = subnetRowY + maxSubnetH + 40;
+  const tableW = Math.max(x - SUBNET_GAP_X - PAD, 700);
+  const tableH = 30 + (hosts.length + 1) * 26;
+  addNode(
+    buildHostPortsTableHtml(subnets, hosts),
+    "html=1;whiteSpace=wrap;strokeWidth=1;fillColor=#ECECFF;strokeColor=#9370DB;align=left;verticalAlign=top;fontSize=12;",
+    PAD, tableY, tableW, tableH,
+  );
+
+  const diagramId = `net-${Date.now().toString(36)}`;
+  return `<mxfile host="app.diagrams.net">
+  <diagram name="Network Map" id="${diagramId}">
+    <mxGraphModel dx="800" dy="600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+${cells.join("\n")}
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
+`;
+}
+
+/** Downloads the draw.io export for every non-hidden subnet/host — same
+ * scope as downloadMermaidDiagram. */
+function downloadDrawioDiagram() {
+  const subnets = state.subnets.filter((sn) => !sn.hidden);
+  const subnetIds = new Set(subnets.map((sn) => sn.id));
+  const hosts = state.hosts.filter((h) => subnetIds.has(h.subnetId));
+  downloadBlob(new Blob([buildDrawioDiagram(subnets, hosts)], { type: "application/xml" }), `network-map-${exportTimestamp()}.drawio`);
+}
+
 /** "Export ▾" mirrors the "Import ▾" menu right next to it:
  *  - Export (filtered): only the hosts matching the current search/status/
  *    tag/risk/etc. filters (see filteredHosts) and hidden-subnet setting —
@@ -2163,9 +2412,10 @@ function downloadMermaidDiagram() {
  *  - Reports (HTML/CSV): a human-readable report of every priority-flagged
  *    host and its findings, for handing to someone who isn't going to load
  *    the network map JSON back into this app.
- *  - Diagrams (Mermaid): a single .mmd file with subnets/hosts as a
- *    color-coded flowchart plus an embedded host/port table (see
- *    buildMermaidDiagram). */
+ *  - Diagrams: a single .mmd file with subnets/hosts as a color-coded
+ *    flowchart plus an embedded host/port table (see buildMermaidDiagram),
+ *    or the same content as a native .drawio file needing no import step
+ *    (see buildDrawioDiagram). */
 function wireExport() {
   const exportMenu = registerDropdownPanel(qs("#exportMenu"));
   qs("#btnExportMenuToggle").addEventListener("click", (e) => {
@@ -2196,6 +2446,10 @@ function wireExport() {
   qs("#btnExportMermaid").addEventListener("click", () => {
     exportMenu.hidden = true;
     downloadMermaidDiagram();
+  });
+  qs("#btnExportDrawio").addEventListener("click", () => {
+    exportMenu.hidden = true;
+    downloadDrawioDiagram();
   });
 }
 
