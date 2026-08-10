@@ -2009,25 +2009,101 @@ function mermaidStatusClass(status) {
   return "statusUp";
 }
 
-/** One host node's label: IP, then hostname and open ports each on their
- * own line (via <br/>) when present, prefixed with a warning marker for an
- * unacknowledged priority host — the same "priority" definition
- * priorityReportHosts uses. */
+/** One host node's label: IP, then hostname (via <br/>) when present,
+ * prefixed with a warning marker for an unacknowledged priority host — the
+ * same "priority" definition priorityReportHosts uses. Ports are
+ * deliberately not shown here — they live only in the ports table
+ * (mermaidPortsTableLines) so the diagram stays readable and each host's
+ * ports appear in exactly one place. */
 function mermaidHostLabel(h) {
   const lines = [h.ip];
   if (h.hostname) lines.push(h.hostname);
-  const openPorts = (h.ports || []).filter((p) => p.state === "open").map((p) => p.port).sort((a, b) => a - b);
-  if (openPorts.length) lines.push(openPorts.join(", "));
   const prefix = h.riskLevel && !h.acknowledged ? "⚠ " : "";
   return prefix + lines.map(mermaidEscape).join("<br/>");
 }
 
-/** Builds a Mermaid flowchart — subnets as subgraphs, hosts as nodes inside
- * them, color-coded by status — for "Diagram (Mermaid, for draw.io)".
- * draw.io can turn this into an editable diagram via Extras > Edit Diagram,
- * pasting this text with the diagram type set to Mermaid. Kept to plain
- * flowchart/subgraph/classDef syntax (no newer Mermaid features) since
- * draw.io's Mermaid support lags the full mermaid.js feature set. */
+function statusLabel(status) {
+  if (status === "down") return "Down";
+  if (status === "unknown") return "Unconfirmed";
+  return "Up";
+}
+
+/** Legend block for buildMermaidDiagram — plain classDef'd nodes, same trick
+ * the diagram itself uses to communicate status by color, just labeled in
+ * English so the file explains its own color key without external docs. */
+function mermaidLegendLines() {
+  return [
+    '  subgraph LEGEND["Legend"]',
+    '    legUp["Up — confirmed live"]:::statusUp',
+    '    legDown["Down — not responding"]:::statusDown',
+    '    legUnk["Unconfirmed — PTR only, no open port"]:::statusUnknown',
+    "  end",
+  ];
+}
+
+/** Escapes a value for use inside an HTML <td>/<th> in a Mermaid node label
+ * — different rules from mermaidEscape's plain-text labels, since this text
+ * lands inside real HTML tags rather than Mermaid label text: & < > " all
+ * need entity-escaping, and the trailing &quot; also keeps the value from
+ * breaking out of the label's own surrounding quotes. */
+function mermaidTableCell(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/[\r\n]+/g, " ")
+    .trim() || "—";
+}
+
+/** Mermaid has no dedicated "table" diagram type, but its flowchart renderer
+ * accepts raw HTML inside a quoted node label (htmlLabels is on by
+ * default) — so a single node whose label is one big <table> renders as an
+ * actual table. This builds that node: one row per host across every
+ * subnet, sorted the same way the diagram's host nodes are. */
+function mermaidPortsTableLines(subnets, hosts) {
+  const bySubnet = new Map();
+  for (const h of hosts) {
+    if (!bySubnet.has(h.subnetId)) bySubnet.set(h.subnetId, []);
+    bySubnet.get(h.subnetId).push(h);
+  }
+
+  const rows = ["<tr><th>Subnet</th><th>IP</th><th>Hostname</th><th>Status</th><th>Open Ports</th></tr>"];
+  for (const sn of subnets) {
+    const snHosts = (bySubnet.get(sn.id) || []).slice().sort((a, b) => a.ip.localeCompare(b.ip, undefined, { numeric: true }));
+    for (const h of snHosts) {
+      const openPorts = (h.ports || [])
+        .filter((p) => p.state === "open")
+        .map((p) => p.port)
+        .sort((a, b) => a - b)
+        .join(", ");
+      rows.push(
+        "<tr>" +
+          `<td>${mermaidTableCell(subnetDisplayLabel(sn))}</td>` +
+          `<td>${mermaidTableCell(h.ip)}</td>` +
+          `<td>${mermaidTableCell(h.hostname)}</td>` +
+          `<td>${statusLabel(h.status)}</td>` +
+          `<td>${mermaidTableCell(openPorts)}</td>` +
+          "</tr>",
+      );
+    }
+  }
+
+  return [
+    '  subgraph PORTS["Hosts & Open Ports"]',
+    `    portsTable["<table>${rows.join("")}</table>"]`,
+    "  end",
+  ];
+}
+
+/** Builds the single Mermaid export: a status legend, subnets as subgraphs
+ * with hosts as color-coded nodes (IP/hostname only, no ports), and a table
+ * node listing every host's open ports — one self-contained .mmd file, pure
+ * Mermaid syntax, no Markdown wrapper. The host/port table relies on raw
+ * HTML inside a node label (htmlLabels), which is a newer-Mermaid feature
+ * some tools' Mermaid parsers (e.g. draw.io's) may not render — this
+ * trades that compatibility for having ports in one place instead of
+ * duplicated onto every node label. */
 function buildMermaidDiagram(subnets, hosts) {
   const bySubnet = new Map();
   for (const h of hosts) {
@@ -2040,28 +2116,37 @@ function buildMermaidDiagram(subnets, hosts) {
     "classDef statusUp fill:#0ca30c,stroke:#087a08,color:#fff;",
     "classDef statusDown fill:#d03b3b,stroke:#9c2323,color:#fff;",
     "classDef statusUnknown fill:#898781,stroke:#5f5d59,color:#fff;",
+    ...mermaidLegendLines(),
   ];
 
   for (const sn of subnets) {
     const snHosts = (bySubnet.get(sn.id) || []).slice().sort((a, b) => a.ip.localeCompare(b.ip, undefined, { numeric: true }));
     lines.push(`  subgraph seg${sn.id}["${mermaidEscape(subnetDisplayLabel(sn))}"]`);
+    lines.push("    direction TB");
     if (snHosts.length === 0) {
       lines.push(`    seg${sn.id}empty["no hosts"]`);
     } else {
       for (const h of snHosts) {
         lines.push(`    host${h.id}["${mermaidHostLabel(h)}"]:::${mermaidStatusClass(h.status)}`);
       }
+      // Host nodes have no real edges between them, so without this chain
+      // Mermaid's layout engine free-arranges them into a grid rather than
+      // honoring "direction TB" above — an invisible link (~~~) between
+      // each consecutive pair is what actually forces the vertical stack.
+      lines.push(`    ${snHosts.map((h) => `host${h.id}`).join(" ~~~ ")}`);
     }
     lines.push("  end");
   }
 
+  lines.push(...mermaidPortsTableLines(subnets, hosts));
+
   return lines.join("\n");
 }
 
-/** Downloads the Mermaid diagram for every non-hidden subnet/host — the
- * same "what's actually in scope" default visibleHosts()/priorityReportHosts
- * use elsewhere, so a hidden management subnet doesn't clutter a diagram
- * meant for sharing outside the app. */
+/** Downloads the Mermaid export for every non-hidden subnet/host — the same
+ * "what's actually in scope" default visibleHosts()/priorityReportHosts use
+ * elsewhere, so a hidden management subnet doesn't clutter a diagram meant
+ * for sharing outside the app. */
 function downloadMermaidDiagram() {
   const subnets = state.subnets.filter((sn) => !sn.hidden);
   const subnetIds = new Set(subnets.map((sn) => sn.id));
@@ -2078,7 +2163,9 @@ function downloadMermaidDiagram() {
  *  - Reports (HTML/CSV): a human-readable report of every priority-flagged
  *    host and its findings, for handing to someone who isn't going to load
  *    the network map JSON back into this app.
- *  - Diagrams (Mermaid): a draw.io-importable flowchart of subnets/hosts. */
+ *  - Diagrams (Mermaid): a single .mmd file with subnets/hosts as a
+ *    color-coded flowchart plus an embedded host/port table (see
+ *    buildMermaidDiagram). */
 function wireExport() {
   const exportMenu = registerDropdownPanel(qs("#exportMenu"));
   qs("#btnExportMenuToggle").addEventListener("click", (e) => {
