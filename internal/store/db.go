@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS hosts (
 	last_seen DATETIME NOT NULL,
 	miss_count INTEGER NOT NULL DEFAULT 0,
 	acknowledged INTEGER NOT NULL DEFAULT 0,
+	new_ack INTEGER NOT NULL DEFAULT 0,
 	UNIQUE(subnet_id, ip)
 );
 
@@ -155,6 +156,7 @@ func Open(path, initialPassword string) (*Store, error) {
 	_, _ = db.Exec(`ALTER TABLE ports ADD COLUMN product TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE ports ADD COLUMN version TEXT NOT NULL DEFAULT ''`)
 	_, _ = db.Exec(`ALTER TABLE risk_rules ADD COLUMN version_below TEXT NOT NULL DEFAULT ''`)
+	_, _ = db.Exec(`ALTER TABLE hosts ADD COLUMN new_ack INTEGER NOT NULL DEFAULT 0`)
 	st := &Store{db: db}
 	if err := st.ensureDefaultAuth(initialPassword); err != nil {
 		db.Close()

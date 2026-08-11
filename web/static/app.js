@@ -170,6 +170,8 @@ const Api = {
 
   ackHost: (id) => Api._req("POST", `/api/hosts/${id}/ack`),
   unackHost: (id) => Api._req("DELETE", `/api/hosts/${id}/ack`),
+  ackHostNew: (id) => Api._req("POST", `/api/hosts/${id}/new-ack`),
+  ackAllHostsNew: () => Api._req("POST", "/api/hosts/new-ack-all"),
   deepScanHost: (id) => Api._req("POST", `/api/hosts/${id}/deep-scan`),
 
   riskRules: () => Api._req("GET", "/api/risk-rules"),
@@ -185,6 +187,7 @@ const Api = {
   updateNetdiscoverEnabled: (netdiscoverEnabled) => Api._req("PATCH", "/api/settings", { netdiscoverEnabled }),
 
   importNetworkMap: (doc) => Api._req("POST", "/api/import/network-map", doc),
+  importSystem: (doc) => Api._req("POST", "/api/import/system", doc),
   importDnsRecon: (records) => Api._req("POST", "/api/import/dnsrecon", records),
   // Raw XML, not JSON — bypasses _req's JSON.stringify/Content-Type: application/json.
   importNmapXml: async (xmlText) => {
@@ -1162,7 +1165,30 @@ function openHostModal(hostId) {
     ]));
   }
 
-  const ackInfoTip = "Marking as checked means you've reviewed this host, so it drops out of priority views (the ⚑ filter, the dashboard's priority count) until something changes. It's automatically un-marked and re-flagged the moment a new port opens on it — it doesn't silence the host permanently.";
+  // The NEW badge stays on a host until a person actually looks at it and
+  // dismisses it here — there's no timer anymore. Deliberately separate from
+  // "mark as checked" below: this is a one-time acknowledgement (no undo,
+  // and nothing brings the badge back later), while checked is a priority
+  // triage state that auto-clears the moment a new port opens.
+  const newInfoTip = "Clears the NEW badge for this host. This is one-time and can't be undone — it won't come back later the way \"marked as checked\" can.";
+  const newRow = qs("#hmNewRow");
+  newRow.innerHTML = "";
+  newRow.hidden = !h.isNew;
+  if (h.isNew) {
+    newRow.appendChild(el("span", { class: "badge-new", text: "NEW" }));
+    newRow.appendChild(el("span", { class: "hm-ack-status", text: "Not yet reviewed." }));
+    newRow.appendChild(el("button", {
+      class: "btn btn-small", onclick: async () => {
+        await Api.ackHostNew(h.id);
+        await refreshHosts();
+        openHostModal(h.id);
+        toast("Host reviewed — no longer flagged as new.");
+      },
+    }, ["Reviewed"]));
+    newRow.appendChild(el("span", { class: "hm-ack-info", tabindex: "0", "aria-label": "What does dismissing NEW do?", "data-tooltip": newInfoTip }, ["ⓘ"]));
+  }
+
+  const ackInfoTip = "Marking as checked means you're happy the current list of open ports is fine, so it drops out of priority views (the ⚑ filter, the dashboard's priority count) until something changes. It's automatically un-marked and re-flagged the moment a new port opens on it — it doesn't silence the host permanently.";
   const ackInfoIcon = el("span", { class: "hm-ack-info", tabindex: "0", "aria-label": "What does marking as checked do?", "data-tooltip": ackInfoTip }, ["ⓘ"]);
 
   const ackRow = qs("#hmAckRow");
@@ -1172,7 +1198,6 @@ function openHostModal(hostId) {
     if (h.acknowledged) {
       ackRow.appendChild(el("div", { class: "hm-ack-status" }, [
         "Marked as checked — won't be flagged as priority unless a new port opens.",
-        ackInfoIcon,
         el("button", {
           class: "btn btn-small", onclick: async () => {
             await Api.unackHost(h.id);
@@ -1181,9 +1206,9 @@ function openHostModal(hostId) {
             toast("Host unmarked.");
           },
         }, ["Unmark"]),
+        ackInfoIcon,
       ]));
     } else {
-      ackRow.appendChild(ackInfoIcon);
       ackRow.appendChild(el("button", {
         class: "btn btn-small", onclick: async () => {
           await Api.ackHost(h.id);
@@ -1192,6 +1217,7 @@ function openHostModal(hostId) {
           toast("Host marked as checked. It'll be re-flagged if a new port opens.");
         },
       }, ["Mark as checked"]));
+      ackRow.appendChild(ackInfoIcon);
     }
   }
 
@@ -1403,6 +1429,17 @@ async function refreshHostsAndSubnets() {
   state.hosts = hosts;
   state.subnets = subnets;
   renderAll();
+}
+
+// Re-pulls risk rules and scan settings and re-renders their Settings-tab
+// UI — used after a system import, the only import that can also change
+// these (see wireImport), since renderRiskRules/renderScanMethodSettings
+// only run against whatever was already in memory otherwise.
+async function refreshRiskRulesAndSettings() {
+  const [riskRules, settings] = await Promise.all([Api.riskRules(), Api.settings()]);
+  state.riskRules = riskRules;
+  renderRiskRules();
+  renderScanMethodSettings(settings);
 }
 
 const refreshDebounced = debounce(refreshHostsAndSubnets, 350);
@@ -2388,18 +2425,25 @@ function downloadDrawioDiagram() {
 }
 
 /** "Export ▾" mirrors the "Import ▾" menu right next to it:
- *  - Export (filtered): only the hosts matching the current search/status/
- *    tag/risk/etc. filters (see filteredHosts) and hidden-subnet setting —
- *    built client-side since the backend has no equivalent filter API.
- *  - Export (all, including hidden): the complete network map regardless of
- *    any UI filter, via the same download the button used to be.
+ *  - Host & subnet data export — Export (filtered) (JSON): only the hosts
+ *    matching the current search/status/tag/risk/etc. filters (see
+ *    filteredHosts) and hidden-subnet setting — built client-side since the
+ *    backend has no equivalent filter API.
+ *  - Host & subnet data export — Export (all, including hidden) (JSON): the
+ *    complete network map regardless of any UI filter, via the same
+ *    download the button used to be.
  *  - Reports (HTML/CSV): a human-readable report of every priority-flagged
  *    host and its findings, for handing to someone who isn't going to load
  *    the network map JSON back into this app.
- *  - Diagrams: a single .mmd file with subnets/hosts as a color-coded
- *    flowchart plus an embedded host/port table (see buildMermaidDiagram),
- *    or the same content as a native .drawio file needing no import step
- *    (see buildDrawioDiagram). */
+ *  - Network diagrams: a single .mmd file with subnets/hosts as a
+ *    color-coded flowchart plus an embedded host/port table (see
+ *    buildMermaidDiagram), or the same content as a native .drawio file
+ *    needing no import step (see buildDrawioDiagram).
+ *  - System: a full backup (subnets — including hidden/disabled state —
+ *    hosts, ports, settings, and risky service triage rules) via
+ *    /api/export/system, for restoring this exact app state elsewhere
+ *    rather than interop with other tooling (see exportSystem in
+ *    internal/api/systemexport.go). */
 function wireExport() {
   const exportMenu = registerDropdownPanel(qs("#exportMenu"));
   qs("#btnExportMenuToggle").addEventListener("click", (e) => {
@@ -2435,21 +2479,30 @@ function wireExport() {
     exportMenu.hidden = true;
     downloadDrawioDiagram();
   });
+  qs("#btnExportSystem").addEventListener("click", () => {
+    exportMenu.hidden = true;
+    window.location.href = "/api/export/system";
+  });
 }
 
-/** Three import flows share one dropdown menu, mirroring the "Scan now ▾"
- * menu right next to it:
- *  - Network map (JSON): restores subnets/hosts/open-ports from a network
- *    map previously downloaded via "Export JSON" — mainly for a fresh run
- *    (in-memory, or a -db-file that doesn't exist yet) that would otherwise
- *    start from a completely empty inventory.
- *  - DNS recon scan (JSON): enriches hosts with hostnames from a dnsrecon
- *    -j scan run outside this app, creating subnets/hosts that don't exist
- *    yet.
- *  - Nmap/masscan scan (XML): imports hosts and open ports from an -oX scan
- *    run outside this app (nmap or masscan — both use the same schema),
- *    creating subnets/hosts that don't exist yet.
- * All three are additive: re-importing, or importing on top of a database
+/** Four import flows share one dropdown menu, split into "scan imports"
+ * (output from an external scan tool run outside this app) and "system
+ * imports" (a document previously exported by this app itself), mirroring
+ * the "Scan now ▾" menu right next to it:
+ *  - DNS recon scan (JSON) [scan import]: enriches hosts with hostnames from
+ *    a dnsrecon -j scan, creating subnets/hosts that don't exist yet.
+ *  - Nmap/masscan scan (XML) [scan import]: imports hosts and open ports
+ *    from an -oX scan (nmap or masscan — both use the same schema), creating
+ *    subnets/hosts that don't exist yet.
+ *  - Network map (JSON) [system import]: restores subnets/hosts/open-ports
+ *    from a network map previously downloaded via "Export JSON" — mainly for
+ *    a fresh run (in-memory, or a -db-file that doesn't exist yet) that
+ *    would otherwise start from a completely empty inventory.
+ *  - System import (all data) [system import]: restores everything a system
+ *    export produced — subnets (including hidden/disabled state), hosts,
+ *    ports, settings, and risky service triage rules — via
+ *    /api/import/system (see importSystem in internal/api/systemexport.go).
+ * All four are additive: re-importing, or importing on top of a database
  * that already has scan data, only ever fills in gaps. */
 function wireImport() {
   const importMenu = registerDropdownPanel(qs("#importMenu"));
@@ -2462,7 +2515,11 @@ function wireImport() {
   importMenu.addEventListener("click", (e) => e.stopPropagation());
   document.addEventListener("click", () => { importMenu.hidden = true; });
 
-  const wireImportItem = (buttonId, fileInputId, apiFn, summarizeFn, runFn = runImport) => {
+  // extraRefresh covers state runFn's own refreshHostsAndSubnets doesn't
+  // touch — only the system import needs it, since it's the only import
+  // that can also change risk rules and settings, and the UI otherwise
+  // wouldn't pick those up until a full page reload.
+  const wireImportItem = (buttonId, fileInputId, apiFn, summarizeFn, runFn = runImport, extraRefresh = null) => {
     const fileInput = qs(fileInputId);
     qs(buttonId).addEventListener("click", () => {
       importMenu.hidden = true;
@@ -2471,12 +2528,17 @@ function wireImport() {
     fileInput.addEventListener("change", async () => {
       const file = fileInput.files[0];
       fileInput.value = ""; // so picking the same file again still fires "change"
-      if (file) await runFn(file, apiFn, summarizeFn);
+      if (!file) return;
+      await runFn(file, apiFn, summarizeFn);
+      if (extraRefresh) await extraRefresh();
     });
   };
 
   wireImportItem("#btnImportNetworkMap", "#importNetworkMapFileInput", Api.importNetworkMap,
     (r) => `Imported ${r.segments} segment(s), ${r.hosts} host(s) (${r.newHosts} new), ${r.newPorts} new open port(s).`);
+  wireImportItem("#btnImportSystem", "#importSystemFileInput", Api.importSystem,
+    (r) => `Imported system export: ${r.segments} segment(s), ${r.hosts} host(s) (${r.newHosts} new), ${r.newPorts} new open port(s), ${r.riskRules} risk rule(s) (${r.newRiskRules} new), settings restored.`,
+    runImport, refreshRiskRulesAndSettings);
   wireImportItem("#btnImportDnsRecon", "#importDnsReconFileInput", Api.importDnsRecon,
     (r) => `Imported dnsrecon scan: ${r.addresses} address(es), ${r.newSubnets} new subnet(s), ${r.newHosts} new host(s).`);
   wireImportItem("#btnImportNmap", "#importNmapFileInput", Api.importNmapXml,
@@ -2935,6 +2997,12 @@ function wireSettings() {
     qs("#stClearHosts").disabled = true;
     await refreshHosts();
     toast("All hosts cleared.");
+  });
+
+  qs("#stMarkAllReviewed").addEventListener("click", async () => {
+    const { reviewed } = await Api.ackAllHostsNew();
+    await refreshHosts();
+    toast(reviewed > 0 ? `${reviewed} host(s) marked as reviewed.` : "No hosts were flagged as new.");
   });
 }
 

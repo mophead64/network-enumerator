@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -59,6 +60,8 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/hosts/{id}/tags/{tagId}", auth(s.removeHostTag))
 	mux.HandleFunc("POST /api/hosts/{id}/ack", auth(s.acknowledgeHost))
 	mux.HandleFunc("DELETE /api/hosts/{id}/ack", auth(s.unacknowledgeHost))
+	mux.HandleFunc("POST /api/hosts/{id}/new-ack", auth(s.acknowledgeHostNew))
+	mux.HandleFunc("POST /api/hosts/new-ack-all", auth(s.acknowledgeAllHostsNew))
 	mux.HandleFunc("POST /api/hosts/{id}/deep-scan", auth(s.deepScanHost))
 
 	mux.HandleFunc("GET /api/tags", auth(s.listTags))
@@ -75,6 +78,8 @@ func (s *Server) Routes(mux *http.ServeMux) {
 
 	mux.HandleFunc("GET /api/export/network-map", auth(s.exportNetworkMap))
 	mux.HandleFunc("POST /api/import/network-map", auth(s.importNetworkMap))
+	mux.HandleFunc("GET /api/export/system", auth(s.exportSystem))
+	mux.HandleFunc("POST /api/import/system", auth(s.importSystem))
 	mux.HandleFunc("POST /api/import/dnsrecon", auth(s.importDNSRecon))
 	mux.HandleFunc("POST /api/import/nmap", auth(s.importNmapXML))
 
@@ -387,6 +392,42 @@ func (s *Server) unacknowledgeHost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, h)
+}
+
+// acknowledgeHostNew dismisses a host's NEW badge for good — see
+// Store.AcknowledgeHostNew. There's no corresponding "un-acknowledge"
+// endpoint: this is meant as a one-time, one-way action.
+func (s *Server) acknowledgeHostNew(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	if err := s.st.AcknowledgeHostNew(id); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h, err := s.st.GetHost(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "host not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, h)
+}
+
+// acknowledgeAllHostsNew is the bulk version of acknowledgeHostNew, offered
+// from Settings — see Store.AcknowledgeAllHostsNew.
+func (s *Server) acknowledgeAllHostsNew(w http.ResponseWriter, r *http.Request) {
+	n, err := s.st.AcknowledgeAllHostsNew()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if n > 0 {
+		ev, _ := s.st.AddEvent("hosts_reviewed", fmt.Sprintf("%d host(s) marked as reviewed.", n), 0)
+		s.hub.Broadcast(ev)
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"reviewed": n})
 }
 
 func (s *Server) deepScanHost(w http.ResponseWriter, r *http.Request) {

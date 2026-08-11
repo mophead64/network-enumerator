@@ -80,27 +80,36 @@
       <div class="notif-wrap">
         <button id="btnExportMenuToggle" class="btn" aria-haspopup="true">Export ▾</button>
         <div id="exportMenu" class="notif-panel account-menu" hidden>
-          <button id="btnExportFiltered" class="account-menu-item" title="Download only the subnets and hosts matching your current search/filters, as JSON">Export (filtered)</button>
-          <button id="btnExportAll" class="account-menu-item" title="Download the complete network map as JSON, including hidden subnets and their hosts">Export (all, including hidden)</button>
+          <div class="account-menu-label">Host &amp; subnet data export</div>
+          <button id="btnExportFiltered" class="account-menu-item" title="Download only the subnets and hosts matching your current search/filters, as JSON">Export (filtered) (JSON)</button>
+          <button id="btnExportAll" class="account-menu-item" title="Download the complete network map as JSON, including hidden subnets and their hosts">Export (all, including hidden) (JSON)</button>
           <div class="account-menu-divider"></div>
           <div class="account-menu-label">Reports</div>
           <button id="btnReportPriorityHtml" class="account-menu-item" title="Download a readable HTML report of every priority-flagged host and its findings">Priority report (HTML)</button>
           <button id="btnReportPriorityCsv" class="account-menu-item" title="Download a CSV report of every priority-flagged host and its findings">Priority report (CSV)</button>
           <div class="account-menu-divider"></div>
-          <div class="account-menu-label">Diagrams</div>
+          <div class="account-menu-label">Network diagrams</div>
           <button id="btnExportMermaid" class="account-menu-item" title="Download a single .mmd file: status legend, subnets/hosts as a color-coded flowchart, and a table of every host's open ports">Mermaid (for draw.io import)</button>
           <button id="btnExportDrawio" class="account-menu-item" title="Download a native .drawio file — same content as the Mermaid export, but opens directly in draw.io with no import step">draw.io (native XML)</button>
+          <div class="account-menu-divider"></div>
+          <div class="account-menu-label">System</div>
+          <button id="btnExportSystem" class="account-menu-item" title="Download a full system backup as JSON — subnets (including hidden/disabled state), hosts, open ports, settings, and risky service triage rules">System export (all data)</button>
         </div>
       </div>
       <div class="notif-wrap">
         <button id="btnImportMenuToggle" class="btn" aria-haspopup="true">Import ▾</button>
         <div id="importMenu" class="notif-panel account-menu" hidden>
-          <button id="btnImportNetworkMap" class="account-menu-item" title="Restore subnets, hosts, and open ports from a previously exported network map JSON file">Network map (JSON)…</button>
+          <div class="account-menu-label">Scan imports</div>
           <button id="btnImportDnsRecon" class="account-menu-item" title="Enrich hosts with hostnames from a dnsrecon -j JSON scan; adds subnets/hosts that don't exist yet">DNS recon scan (JSON)…</button>
           <button id="btnImportNmap" class="account-menu-item" title="Import hosts and open ports from an nmap or masscan -oX XML scan; adds subnets/hosts that don't exist yet">Nmap/masscan scan (XML)…</button>
+          <div class="account-menu-divider"></div>
+          <div class="account-menu-label">System imports</div>
+          <button id="btnImportNetworkMap" class="account-menu-item" title="Restore subnets, hosts, and open ports from a previously exported network map JSON file">Network map (JSON)…</button>
+          <button id="btnImportSystem" class="account-menu-item" title="Restore a full system backup — subnets (including hidden/disabled state), hosts, open ports, settings, and risky service triage rules — from a previously exported system export JSON file">System import (all data)…</button>
         </div>
       </div>
       <input id="importNetworkMapFileInput" type="file" accept="application/json,.json" hidden>
+      <input id="importSystemFileInput" type="file" accept="application/json,.json" hidden>
       <input id="importDnsReconFileInput" type="file" accept="application/json,.json" hidden>
       <input id="importNmapFileInput" type="file" accept="text/xml,application/xml,.xml" hidden>
       <div class="notif-wrap">
@@ -131,7 +140,7 @@
         <div class="legend">
           <div class="legend-row"><span class="swatch status-good"></span>up</div>
           <div class="legend-row"><span class="swatch status-critical"></span>down</div>
-          <div class="legend-row"><span class="swatch status-new"></span>new (≤15m)</div>
+          <div class="legend-row"><span class="swatch status-new"></span>new (not yet reviewed)</div>
           <div class="legend-row"><span class="swatch swatch-subnet"></span>subnet (click to collapse)</div>
           <div class="legend-row"><span class="swatch swatch-bucket"></span>range (click to expand)</div>
         </div>
@@ -268,6 +277,12 @@
             </div>
           </section>
 
+          <section class="settings-section">
+            <h3>Host review</h3>
+            <p class="muted small">Dismiss the NEW badge on every host at once — the same one-time, one-way acknowledgement as the "Reviewed" button on a host's detail view, applied in bulk.</p>
+            <button id="stMarkAllReviewed" type="button" class="btn btn-small">Mark all hosts as reviewed</button>
+          </section>
+
           <p id="stVersionInfo" class="muted small settings-version"></p>
         </div>
       </div>
@@ -284,6 +299,7 @@
     </div>
     <div class="modal-body">
       <div id="hmCallouts"></div>
+      <div id="hmNewRow" class="hm-ack-row" hidden></div>
       <div id="hmAckRow" class="hm-ack-row" hidden></div>
       <div class="hm-meta">
         <div><span class="muted small">Status</span><div id="hmStatus"></div></div>

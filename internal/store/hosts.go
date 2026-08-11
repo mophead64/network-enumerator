@@ -217,6 +217,33 @@ func (s *Store) UnacknowledgeHost(id int64) error {
 	return err
 }
 
+// AcknowledgeHostNew dismisses this host's NEW badge for good. Unlike
+// AcknowledgeHost (priority triage, auto-cleared the moment a new port
+// opens), this is a one-time, one-way acknowledgement: nothing ever flips
+// new_ack back to 0, and a host's "new" status no longer expires on its own
+// after a fixed window — see IsNew in ListHosts/GetHost.
+func (s *Store) AcknowledgeHostNew(id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`UPDATE hosts SET new_ack = 1 WHERE id = ?`, id)
+	return err
+}
+
+// AcknowledgeAllHostsNew is the bulk version of AcknowledgeHostNew — dismisses
+// the NEW badge for every host at once, offered from Settings for clearing a
+// backlog in one action rather than host by host. Returns how many hosts
+// were actually still new (and so got touched).
+func (s *Store) AcknowledgeAllHostsNew() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(`UPDATE hosts SET new_ack = 1 WHERE new_ack = 0`)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
+}
+
 // ClearAcknowledgementIfSet un-acknowledges a host and reports whether it
 // actually was acknowledged beforehand. Called when a new port is discovered
 // open on the host, since a previously-reviewed host with a materially
@@ -301,7 +328,7 @@ func (s *Store) SweepMissingHosts(subnetID int64, seenIPs map[string]bool, thres
 
 func (s *Store) ListHosts() ([]model.Host, error) {
 	s.mu.Lock()
-	hostRows, err := s.db.Query(`SELECT id, subnet_id, ip, mac, hostname, vendor, status, source, notes, first_seen, last_seen, acknowledged FROM hosts ORDER BY subnet_id, ip`)
+	hostRows, err := s.db.Query(`SELECT id, subnet_id, ip, mac, hostname, vendor, status, source, notes, first_seen, last_seen, acknowledged, new_ack FROM hosts ORDER BY subnet_id, ip`)
 	if err != nil {
 		s.mu.Unlock()
 		return nil, err
@@ -309,12 +336,13 @@ func (s *Store) ListHosts() ([]model.Host, error) {
 	hosts := []model.Host{}
 	for hostRows.Next() {
 		var h model.Host
-		if err := hostRows.Scan(&h.ID, &h.SubnetID, &h.IP, &h.MAC, &h.Hostname, &h.Vendor, &h.Status, &h.Source, &h.Notes, &h.FirstSeen, &h.LastSeen, &h.Acknowledged); err != nil {
+		var newAck bool
+		if err := hostRows.Scan(&h.ID, &h.SubnetID, &h.IP, &h.MAC, &h.Hostname, &h.Vendor, &h.Status, &h.Source, &h.Notes, &h.FirstSeen, &h.LastSeen, &h.Acknowledged, &newAck); err != nil {
 			hostRows.Close()
 			s.mu.Unlock()
 			return nil, err
 		}
-		h.IsNew = time.Since(h.FirstSeen) < newHighlightWindow
+		h.IsNew = !newAck
 		hosts = append(hosts, h)
 	}
 	hostRows.Close()
@@ -353,8 +381,9 @@ func (s *Store) ListHosts() ([]model.Host, error) {
 func (s *Store) GetHost(id int64) (model.Host, error) {
 	s.mu.Lock()
 	var h model.Host
-	err := s.db.QueryRow(`SELECT id, subnet_id, ip, mac, hostname, vendor, status, source, notes, first_seen, last_seen, acknowledged FROM hosts WHERE id = ?`, id).
-		Scan(&h.ID, &h.SubnetID, &h.IP, &h.MAC, &h.Hostname, &h.Vendor, &h.Status, &h.Source, &h.Notes, &h.FirstSeen, &h.LastSeen, &h.Acknowledged)
+	var newAck bool
+	err := s.db.QueryRow(`SELECT id, subnet_id, ip, mac, hostname, vendor, status, source, notes, first_seen, last_seen, acknowledged, new_ack FROM hosts WHERE id = ?`, id).
+		Scan(&h.ID, &h.SubnetID, &h.IP, &h.MAC, &h.Hostname, &h.Vendor, &h.Status, &h.Source, &h.Notes, &h.FirstSeen, &h.LastSeen, &h.Acknowledged, &newAck)
 	if err != nil {
 		s.mu.Unlock()
 		return h, err
@@ -372,7 +401,7 @@ func (s *Store) GetHost(id int64) (model.Host, error) {
 		return h, err
 	}
 
-	h.IsNew = time.Since(h.FirstSeen) < newHighlightWindow
+	h.IsNew = !newAck
 	applySuspectFlag(&h, macCount)
 	h.Tags, err = s.tagsForHost(h.ID)
 	if err != nil {
