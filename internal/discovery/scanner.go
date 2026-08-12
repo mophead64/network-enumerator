@@ -37,6 +37,22 @@ func DefaultConfig() Config {
 	}
 }
 
+// ScanMode forces a specific technique for a manually triggered scan cycle
+// (see TriggerQuickScanAll/TriggerMassScanAll/TriggerDeepScanAll),
+// regardless of the configured Settings scan-method preference. The zero
+// value "" is the regular automatic/system-triggered cycle (a new subnet
+// was added, data was imported, the interval timer fired, ...), which keeps
+// respecting that preference exactly as before — only an explicit mode
+// bypasses it.
+type ScanMode string
+
+const (
+	ScanModeQuick      ScanMode = "quick" // built-in TCP/ICMP prober, common ports — fast, doesn't need nmap
+	ScanModeMass       ScanMode = "mass"  // nmap forced, common ports — broad nmap sweep across every host
+	ScanModeDeep       ScanMode = "deep"  // nmap forced, all 65535 ports — thorough but slow
+	ScanModeReverseDNS ScanMode = "dns"   // dnsrecon/dig -x only, no ping/TCP/ARP — see scanSubnetReverseDNS
+)
+
 type Scanner struct {
 	st     *store.Store
 	cfg    Config
@@ -46,8 +62,11 @@ type Scanner struct {
 	statusMu sync.Mutex
 	status   model.ScanStatus
 
-	trigger     chan struct{}
-	deepTrigger chan struct{}
+	trigger        chan struct{} // unforced: respects the configured scan-method setting
+	triggerQuick   chan struct{}
+	triggerMass    chan struct{}
+	triggerDeep    chan struct{}
+	triggerReverse chan struct{}
 
 	deepScanMu   sync.Mutex
 	deepScanning map[int64]bool // hostID -> a deep scan is currently running for it
@@ -60,14 +79,17 @@ func NewScanner(st *store.Store, cfg Config, notify func(model.Event)) *Scanner 
 		pinger = nil
 	}
 	return &Scanner{
-		st:           st,
-		cfg:          cfg,
-		pinger:       pinger,
-		notify:       notify,
-		status:       model.ScanStatus{IntervalSec: int(cfg.Interval.Seconds())},
-		trigger:      make(chan struct{}, 1),
-		deepTrigger:  make(chan struct{}, 1),
-		deepScanning: make(map[int64]bool),
+		st:             st,
+		cfg:            cfg,
+		pinger:         pinger,
+		notify:         notify,
+		status:         model.ScanStatus{IntervalSec: int(cfg.Interval.Seconds())},
+		trigger:        make(chan struct{}, 1),
+		triggerQuick:   make(chan struct{}, 1),
+		triggerMass:    make(chan struct{}, 1),
+		triggerDeep:    make(chan struct{}, 1),
+		triggerReverse: make(chan struct{}, 1),
+		deepScanning:   make(map[int64]bool),
 	}
 }
 
@@ -84,8 +106,11 @@ func (s *Scanner) Status() model.ScanStatus {
 }
 
 // TriggerNow requests an immediate scan cycle without waiting for the
-// interval timer. It's non-blocking: if a scan is already queued to start,
-// this is a no-op.
+// interval timer — the regular, unforced cycle that still respects the
+// configured scan-method setting. Used for system-triggered rescans (a
+// subnet was just added, data was imported, ...), not the user-facing
+// Quick/Mass/Deep actions. Non-blocking: if a scan is already queued to
+// start, this is a no-op.
 func (s *Scanner) TriggerNow() {
 	select {
 	case s.trigger <- struct{}{}:
@@ -93,21 +118,56 @@ func (s *Scanner) TriggerNow() {
 	}
 }
 
-// TriggerDeepScanAll requests an immediate scan cycle that probes every TCP
-// port (1-65535) on every host, instead of the curated CommonPorts list a
-// normal cycle uses. Much slower across a whole subnet than DeepScanHost is
-// for one host — it's still bounded by the usual host/port concurrency, so
-// it won't run away, but it can take a long time on a large network.
-// Non-blocking: if one is already queued, this is a no-op.
+// TriggerQuickScanAll requests an immediate scan cycle that forces the
+// built-in TCP/ICMP prober (common ports), regardless of the configured
+// scan-method setting — the "Quick scan" action. Non-blocking: if one is
+// already queued, this is a no-op.
+func (s *Scanner) TriggerQuickScanAll() {
+	select {
+	case s.triggerQuick <- struct{}{}:
+	default:
+	}
+}
+
+// TriggerMassScanAll requests an immediate scan cycle that forces nmap
+// (common ports) across every host, regardless of the configured
+// scan-method setting — the "Mass scan" action. Non-blocking: if one is
+// already queued, this is a no-op.
+func (s *Scanner) TriggerMassScanAll() {
+	select {
+	case s.triggerMass <- struct{}{}:
+	default:
+	}
+}
+
+// TriggerDeepScanAll requests an immediate scan cycle that forces nmap
+// against every TCP port (1-65535) on every host, instead of the curated
+// CommonPorts list a normal cycle uses — the "Deep scan" action. Much
+// slower across a whole subnet than DeepScanHost is for one host — it's
+// still bounded by the usual host/port concurrency, so it won't run away,
+// but it can take a long time on a large network. Non-blocking: if one is
+// already queued, this is a no-op.
 func (s *Scanner) TriggerDeepScanAll() {
 	select {
-	case s.deepTrigger <- struct{}{}:
+	case s.triggerDeep <- struct{}{}:
+	default:
+	}
+}
+
+// TriggerReverseDNSScanAll requests an immediate scan cycle that sweeps
+// every address in every subnet for a PTR record (dnsrecon if installed,
+// else dig -x per address) instead of the usual ping/TCP/ARP discovery —
+// the "Reverse DNS scan" action. See scanSubnetReverseDNS. Non-blocking: if
+// one is already queued, this is a no-op.
+func (s *Scanner) TriggerReverseDNSScanAll() {
+	select {
+	case s.triggerReverse <- struct{}{}:
 	default:
 	}
 }
 
 func (s *Scanner) Run(ctx context.Context) {
-	s.runOnce(ctx, false)
+	s.runOnce(ctx, "")
 	ticker := time.NewTicker(s.cfg.Interval)
 	defer ticker.Stop()
 	for {
@@ -115,12 +175,21 @@ func (s *Scanner) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.runOnce(ctx, false)
+			s.runOnce(ctx, "")
 		case <-s.trigger:
-			s.runOnce(ctx, false)
+			s.runOnce(ctx, "")
 			ticker.Reset(s.cfg.Interval)
-		case <-s.deepTrigger:
-			s.runOnce(ctx, true)
+		case <-s.triggerQuick:
+			s.runOnce(ctx, ScanModeQuick)
+			ticker.Reset(s.cfg.Interval)
+		case <-s.triggerMass:
+			s.runOnce(ctx, ScanModeMass)
+			ticker.Reset(s.cfg.Interval)
+		case <-s.triggerDeep:
+			s.runOnce(ctx, ScanModeDeep)
+			ticker.Reset(s.cfg.Interval)
+		case <-s.triggerReverse:
+			s.runOnce(ctx, ScanModeReverseDNS)
 			ticker.Reset(s.cfg.Interval)
 		}
 	}
@@ -138,15 +207,20 @@ func (s *Scanner) emit(evType, message string, entityID int64) {
 	}
 }
 
-func (s *Scanner) runOnce(ctx context.Context, deep bool) {
-	if deep {
-		log.Printf("scan: starting deep cycle (all 65535 ports)")
+// runOnce executes one scan cycle across every enabled subnet. mode is ""
+// for the regular automatic/system-triggered cycle (respects the configured
+// scan-method setting), or one of ScanModeQuick/ScanModeMass/ScanModeDeep/
+// ScanModeReverseDNS to force a specific technique for a manually triggered
+// cycle — see ScanMode.
+func (s *Scanner) runOnce(ctx context.Context, mode ScanMode) {
+	if mode != "" {
+		log.Printf("scan: starting %s cycle", mode)
 	} else {
 		log.Printf("scan: starting cycle")
 	}
 	s.statusMu.Lock()
 	s.status.Running = true
-	s.status.Deep = deep
+	s.status.Mode = string(mode)
 	s.status.LastStarted = time.Now()
 	s.status.HostsScanned = 0
 	s.statusMu.Unlock()
@@ -190,7 +264,7 @@ func (s *Scanner) runOnce(ctx context.Context, deep bool) {
 		wg.Add(1)
 		go func(sn model.Subnet) {
 			defer wg.Done()
-			n := s.scanSubnet(ctx, sn, deep)
+			n := s.scanSubnet(ctx, sn, mode)
 			atomic.AddInt64(&total, int64(n))
 		}(sn)
 	}
@@ -198,7 +272,7 @@ func (s *Scanner) runOnce(ctx context.Context, deep bool) {
 
 	s.statusMu.Lock()
 	s.status.Running = false
-	s.status.Deep = false
+	s.status.Mode = ""
 	s.status.LastFinished = time.Now()
 	s.status.HostsScanned = int(total)
 	s.statusMu.Unlock()
@@ -210,6 +284,8 @@ func (s *Scanner) runOnce(ctx context.Context, deep bool) {
 // falling back to the built-in TCP/ICMP prober otherwise; "nmap"/"tcp" force
 // one or the other. A forced "nmap" preference without the binary installed
 // still falls back (with a log line) rather than silently scanning nothing.
+// Only consulted for the regular, unforced cycle (mode == "") — see
+// resolveScanMethod.
 func (s *Scanner) effectiveScanMethod() (method, nmapPath string) {
 	pref, err := s.st.GetScanMethod()
 	if err != nil {
@@ -229,11 +305,72 @@ func (s *Scanner) effectiveScanMethod() (method, nmapPath string) {
 	return "nmap", path
 }
 
-func (s *Scanner) scanSubnet(ctx context.Context, sn model.Subnet, deep bool) int {
-	if method, nmapPath := s.effectiveScanMethod(); method == "nmap" {
+// resolveScanMethod picks which technique a cycle actually uses: an
+// explicit mode forces tcp (ScanModeQuick) or nmap (ScanModeMass/
+// ScanModeDeep) outright; mode == "" (the regular automatic/system-
+// triggered cycle) falls back to the configured Settings scan-method
+// preference via effectiveScanMethod, same as before ScanMode existed. The
+// API layer checks nmap's availability before ever queuing a mass/deep
+// trigger, but this still falls back to tcp (with a log line) rather than
+// scanning nothing in the unlikely case the binary vanishes in between.
+func (s *Scanner) resolveScanMethod(mode ScanMode) (method, nmapPath string) {
+	switch mode {
+	case ScanModeQuick:
+		return "tcp", ""
+	case ScanModeMass, ScanModeDeep:
+		path, available := NmapPath()
+		if !available {
+			log.Printf("%s scan requested but nmap isn't on PATH; using built-in TCP/ICMP scanning for this cycle", mode)
+			return "tcp", ""
+		}
+		return "nmap", path
+	default:
+		return s.effectiveScanMethod()
+	}
+}
+
+func (s *Scanner) scanSubnet(ctx context.Context, sn model.Subnet, mode ScanMode) int {
+	if mode == ScanModeReverseDNS {
+		return s.scanSubnetReverseDNS(ctx, sn)
+	}
+	deep := mode == ScanModeDeep
+	if method, nmapPath := s.resolveScanMethod(mode); method == "nmap" {
 		return s.scanSubnetNmap(ctx, sn, deep, nmapPath)
 	}
 	return s.scanSubnetTCP(ctx, sn, deep)
+}
+
+// scanSubnetReverseDNS is the "Reverse DNS scan" action: skips ping/TCP/ARP
+// discovery entirely and sweeps every address in sn for a PTR record (via
+// dnsrecon if installed, else dig -x per address — see reverseDNSSweep),
+// port-scanning (common ports) whatever it finds to try to confirm it up —
+// exactly the passive DNS-only pass a regular cycle already runs for
+// addresses it couldn't otherwise reach (see scanUnconfirmedByDNS), just
+// run here against the whole subnet on demand instead of only what that
+// cycle happened to miss.
+//
+// Deliberately does not sweep for "missing" hosts the way scanSubnetTCP/
+// scanSubnetNmap do: most real hosts have no PTR record at all, so treating
+// "no PTR hit this cycle" as evidence a host went away would flip
+// previously-confirmed hosts to "down" for no real reason. A reverse DNS
+// scan can only add information, never take a host's status away.
+func (s *Scanner) scanSubnetReverseDNS(ctx context.Context, sn model.Subnet) int {
+	ips, err := ExpandIPv4(sn.CIDR)
+	if err != nil {
+		log.Printf("expand %s: %v", sn.CIDR, err)
+		return 0
+	}
+	candidates := make([]string, len(ips))
+	for i, ip := range ips {
+		candidates[i] = ip.String()
+	}
+
+	confirmed := s.scanUnconfirmedByDNS(ctx, candidates, sn, false)
+
+	if err := s.st.TouchSubnetScan(sn.ID); err != nil {
+		log.Printf("touch subnet scan: %v", err)
+	}
+	return len(confirmed)
 }
 
 // netdiscoverPath resolves whether ARP-based discovery via netdiscover
@@ -280,6 +417,193 @@ func (s *Scanner) netdiscoverAugment(ctx context.Context, sn model.Subnet) map[s
 	return found
 }
 
+// unseenIPStrings returns every address in ips whose string form isn't a key
+// in seen — the candidate list scanUnconfirmedByDNS sweeps with dig -x.
+func unseenIPStrings(ips []net.IP, seen map[string]bool) []string {
+	out := make([]string, 0, len(ips)-len(seen))
+	for _, ip := range ips {
+		if s := ip.String(); !seen[s] {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func sliceToSet(ips []string) map[string]bool {
+	set := make(map[string]bool, len(ips))
+	for _, ip := range ips {
+		set[ip] = true
+	}
+	return set
+}
+
+// digPath resolves whether dig-based reverse-DNS discovery should run this
+// cycle — just binary presence on PATH, same as NmapPath/NetdiscoverPath.
+func (s *Scanner) digPath() (string, bool) {
+	return DigPath()
+}
+
+// reverseDNSSweepTimeout bounds both the dnsrecon batch sweep and the
+// per-address dig -x fallback (dig itself is bounded separately, per call,
+// by cfg.DNSTimeout — this is the budget for the whole subnet).
+const reverseDNSSweepTimeout = 45 * time.Second
+
+// dnsOnlyResult is what scanUnconfirmedByDNS found and confirmed for one
+// candidate address.
+type dnsOnlyResult struct {
+	hostID    int64
+	openPorts map[int]bool
+}
+
+// scanUnconfirmedByDNS is the "additional enumeration task" a reverse-DNS
+// sweep adds on top of ping/TCP/ARP discovery: for candidates — addresses
+// none of those found alive — see whether DNS knows about them via a PTR
+// record (via reverseDNSSweep). A PTR hit is a much weaker signal than a
+// live probe: it's a static DNS entry that persists whether or not the
+// device behind it is even powered on, so finding one is never proof a host
+// is up. Each hit is recorded via UpsertUnconfirmedHost (status "unknown",
+// never "up"/"down") and still port-scanned anyway, since a TCP connect
+// probe doesn't need ICMP to succeed — only an actual open port is real
+// confirmation, at which point the host is promoted to "up" and returned
+// here so the caller can fold it into its normal alive/seen bookkeeping
+// instead of scanning its ports a second time.
+func (s *Scanner) scanUnconfirmedByDNS(ctx context.Context, candidates []string, sn model.Subnet, deep bool) map[string]dnsOnlyResult {
+	hostnames := s.reverseDNSSweep(ctx, sn, candidates)
+	if len(hostnames) == 0 {
+		return nil
+	}
+
+	confirmed := make(map[string]dnsOnlyResult)
+	var mu sync.Mutex
+	sem := make(chan struct{}, s.cfg.HostConcurrency)
+	var wg sync.WaitGroup
+	for ip, hostname := range hostnames {
+		ip, hostname := ip, hostname
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			hostID, isNew, err := s.st.UpsertUnconfirmedHost(sn.ID, ip, hostname)
+			if err != nil {
+				log.Printf("upsert unconfirmed host %s: %v", ip, err)
+				return
+			}
+			if isNew {
+				s.emit("new_host", fmt.Sprintf(
+					"Reverse DNS found %s (%s) — no ping/TCP/ARP response, not yet confirmed up; watching for an open port",
+					ip, hostname), hostID)
+			}
+
+			openPorts := s.scanPorts(hostID, ip, deep)
+			if len(openPorts) == 0 {
+				return
+			}
+			if err := s.st.ConfirmHostUp(hostID); err != nil {
+				log.Printf("confirm host up %s: %v", ip, err)
+				return
+			}
+			mu.Lock()
+			confirmed[ip] = dnsOnlyResult{hostID: hostID, openPorts: openPorts}
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return confirmed
+}
+
+// reverseDNSSweep resolves hostnames for candidates using whichever
+// reverse-DNS tool is available, preferring dnsrecon's single-process range
+// sweep (see RunDnsrecon) over spawning `dig -x` once per candidate address
+// when both happen to be installed — a /24 with nothing else discovered is
+// 254 dig subprocesses against one dnsrecon invocation. Falls back to dig -x
+// (per-candidate, so it still works on a handful of otherwise-silent
+// addresses rather than the whole subnet) when dnsrecon isn't on PATH or
+// its sweep fails, and returns nil if neither tool is available.
+func (s *Scanner) reverseDNSSweep(ctx context.Context, sn model.Subnet, candidates []string) map[string]string {
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	if path, ok := DnsreconPath(); ok {
+		results, err := RunDnsrecon(ctx, path, sn.CIDR, reverseDNSSweepTimeout)
+		if err != nil {
+			log.Printf("dnsrecon %s: %v — falling back to dig -x per address", sn.CIDR, err)
+		} else {
+			candSet := sliceToSet(candidates)
+			out := make(map[string]string, len(results))
+			for ip, names := range results {
+				if candSet[ip] && len(names) > 0 {
+					out[ip] = names[0]
+				}
+			}
+			return out
+		}
+	}
+
+	digPath, ok := s.digPath()
+	if !ok {
+		return nil
+	}
+	out := make(map[string]string)
+	var mu sync.Mutex
+	sem := make(chan struct{}, s.cfg.HostConcurrency)
+	var wg sync.WaitGroup
+	for _, ip := range candidates {
+		ip := ip
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if hostname := ReverseDNSDig(ctx, digPath, ip, s.cfg.DNSTimeout); hostname != "" {
+				mu.Lock()
+				out[ip] = hostname
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	return out
+}
+
+// nmapCycleState is scanSubnetNmap's per-cycle bookkeeping, shared across
+// every host's goroutine (guarded by mu) as each finishes recording itself.
+type nmapCycleState struct {
+	mu             sync.Mutex
+	arpTable       map[string]string // one kernel-table read, reused for every host this cycle
+	hostIDs        map[string]int64
+	seen           map[string]bool
+	macCounts      map[string]int
+	unionOpenPorts map[int]bool
+	pingOnlyCount  int64
+}
+
+// foldDNSConfirmed merges one scanUnconfirmedByDNS result into st. The host
+// is already recorded (status promoted "unknown" -> "up") and port-scanned
+// by scanUnconfirmedByDNS itself — this only adds what that pass couldn't
+// supply (a MAC, if the kernel ARP table happens to have one) and folds its
+// open ports into the union nmap enriches, without probing or port-scanning
+// the host a second time.
+func (s *Scanner) foldDNSConfirmed(sn model.Subnet, ip string, res dnsOnlyResult, st *nmapCycleState) {
+	mac := st.arpTable[ip]
+	if mac != "" {
+		if _, _, err := s.st.UpsertHost(sn.ID, ip, mac, "", ""); err != nil {
+			log.Printf("update host mac %s: %v", ip, err)
+		}
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	st.hostIDs[ip] = res.hostID
+	st.seen[ip] = true
+	if mac != "" {
+		st.macCounts[mac]++
+	}
+	for port := range res.openPorts {
+		st.unionOpenPorts[port] = true
+	}
+}
+
 // discoverAliveHosts fans the same fast TCP/ICMP probe scanSubnetTCP uses
 // out across every address in cidr and returns the ones that answered.
 // scanSubnetNmap runs this first and hands nmap only the resulting list
@@ -316,6 +640,44 @@ func (s *Scanner) discoverAliveHosts(cidr string) ([]string, error) {
 	return alive, nil
 }
 
+// discoverAliveHostsAllSources is discoverAliveHosts plus the two weaker
+// discovery signals scanSubnetNmap unions on top of it: netdiscover's ARP
+// sweep, and a dig -x reverse-DNS sweep of whatever's left unseen by either
+// of those. The dig -x pass runs *before* any "nothing found" bailout so a
+// subnet with zero ping/TCP/ARP responses but a DNS-confirmed host isn't
+// reported as fully dark. Returns the combined alive list, netdiscover's
+// finds (for MAC/vendor enrichment), and dig's confirmed-by-open-port finds
+// (already recorded and port-scanned, so the caller shouldn't redo either).
+func (s *Scanner) discoverAliveHostsAllSources(ctx context.Context, sn model.Subnet, deep bool) (alive []string, ndHosts map[string]NetdiscoverHost, dnsConfirmed map[string]dnsOnlyResult, err error) {
+	alive, err = s.discoverAliveHosts(sn.CIDR)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	// ARP-only hosts (filtered ICMP/TCP but still answering ARP) never show
+	// up in the built-in prober's alive list, so netdiscover's finds are
+	// unioned in here rather than only used to enrich hosts already found.
+	ndHosts = s.netdiscoverAugment(ctx, sn)
+	aliveSet := sliceToSet(alive)
+	for ip := range ndHosts {
+		if !aliveSet[ip] {
+			alive = append(alive, ip)
+			aliveSet[ip] = true
+		}
+	}
+
+	allIPs, expErr := ExpandIPv4(sn.CIDR)
+	if expErr != nil {
+		log.Printf("expand %s: %v", sn.CIDR, expErr)
+		return alive, ndHosts, nil, nil
+	}
+	dnsConfirmed = s.scanUnconfirmedByDNS(ctx, unseenIPStrings(allIPs, sliceToSet(alive)), sn, deep)
+	for ip := range dnsConfirmed {
+		alive = append(alive, ip)
+	}
+	return alive, ndHosts, dnsConfirmed, nil
+}
+
 // scanSubnetNmap discovers which hosts in sn are up and which ports they
 // have open using the fast built-in TCP/ICMP prober — the same one
 // scanSubnetTCP uses — then hands nmap only the ports that step already
@@ -346,29 +708,13 @@ func (s *Scanner) scanSubnetNmap(ctx context.Context, sn model.Subnet, deep bool
 		versionIntensity = 0
 	}
 
-	alive, err := s.discoverAliveHosts(sn.CIDR)
+	alive, ndHosts, dnsConfirmed, err := s.discoverAliveHostsAllSources(ctx, sn, deep)
 	if err != nil {
 		log.Printf("expand %s: %v", sn.CIDR, err)
 		return 0
 	}
 	if err := s.st.TouchSubnetScan(sn.ID); err != nil {
 		log.Printf("touch subnet scan: %v", err)
-	}
-
-	// ARP-only hosts (filtered ICMP/TCP but still answering ARP) never show
-	// up in the built-in prober's alive list, so netdiscover's finds are
-	// unioned in here rather than only used to enrich hosts already found.
-	ndHosts := s.netdiscoverAugment(ctx, sn)
-	if len(ndHosts) > 0 {
-		aliveSet := make(map[string]bool, len(alive))
-		for _, ip := range alive {
-			aliveSet[ip] = true
-		}
-		for ip := range ndHosts {
-			if !aliveSet[ip] {
-				alive = append(alive, ip)
-			}
-		}
 	}
 
 	if len(alive) == 0 {
@@ -382,24 +728,28 @@ func (s *Scanner) scanSubnetNmap(ctx context.Context, sn model.Subnet, deep bool
 	// nmap below only adds product/version on top of it. Hosts and their
 	// ports land in the UI within seconds of being probed, rather than
 	// waiting on nmap's much slower enrichment pass to finish first.
-	arpTable := ARPTable() // one kernel-table read, reused for every host below
+	st := &nmapCycleState{
+		arpTable:       ARPTable(),
+		hostIDs:        make(map[string]int64, len(alive)),
+		seen:           make(map[string]bool, len(alive)),
+		macCounts:      make(map[string]int),
+		unionOpenPorts: make(map[int]bool),
+	}
 	sem := make(chan struct{}, s.cfg.HostConcurrency)
 	var wg sync.WaitGroup
-	var mu sync.Mutex
-	hostIDs := make(map[string]int64, len(alive))
-	seen := make(map[string]bool, len(alive))
-	macCounts := make(map[string]int)
-	unionOpenPorts := make(map[int]bool)
-	var pingOnlyCount int64
 
 	for _, ip := range alive {
 		ip := ip
+		if res, ok := dnsConfirmed[ip]; ok {
+			s.foldDNSConfirmed(sn, ip, res, st)
+			continue
+		}
 		wg.Add(1)
 		sem <- struct{}{}
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			mac := arpTable[ip]
+			mac := st.arpTable[ip]
 			vendor := ""
 			if nd, ok := ndHosts[ip]; ok {
 				if mac == "" {
@@ -414,46 +764,46 @@ func (s *Scanner) scanSubnetNmap(ctx context.Context, sn model.Subnet, deep bool
 			}
 			openPorts := s.scanPorts(hostID, ip, deep)
 
-			mu.Lock()
-			defer mu.Unlock()
-			hostIDs[ip] = hostID
-			seen[ip] = true
+			st.mu.Lock()
+			defer st.mu.Unlock()
+			st.hostIDs[ip] = hostID
+			st.seen[ip] = true
 			if mac != "" {
-				macCounts[mac]++
+				st.macCounts[mac]++
 			}
 			if len(openPorts) == 0 {
-				pingOnlyCount++
+				st.pingOnlyCount++
 			}
 			for port := range openPorts {
-				unionOpenPorts[port] = true
+				st.unionOpenPorts[port] = true
 			}
 		}()
 	}
 	wg.Wait()
 
-	s.checkPingOnlyAnomaly(sn, len(seen), pingOnlyCount)
-	s.checkDuplicateMACAnomaly(sn, macCounts)
-	s.emitHostDownEvents(sn, seen)
+	s.checkPingOnlyAnomaly(sn, len(st.seen), st.pingOnlyCount)
+	s.checkDuplicateMACAnomaly(sn, st.macCounts)
+	s.emitHostDownEvents(sn, st.seen)
 
-	if len(unionOpenPorts) == 0 {
-		return len(seen) // nothing open anywhere on this subnet to enrich
+	if len(st.unionOpenPorts) == 0 {
+		return len(st.seen) // nothing open anywhere on this subnet to enrich
 	}
-	enrichPorts := make([]int, 0, len(unionOpenPorts))
-	for port := range unionOpenPorts {
+	enrichPorts := make([]int, 0, len(st.unionOpenPorts))
+	for port := range st.unionOpenPorts {
 		enrichPorts = append(enrichPorts, port)
 	}
 
-	log.Printf("nmap enrichment: starting for %s — %d open port(s) across %d host(s)", sn.CIDR, len(enrichPorts), len(seen))
+	log.Printf("nmap enrichment: starting for %s — %d open port(s) across %d host(s)", sn.CIDR, len(enrichPorts), len(st.seen))
 	nmapHosts, err := RunNmap(ctx, nmapPath, alive, enrichPorts, hostTimeout, versionIntensity)
 	if err != nil {
 		// Port state is already fully recorded above from the built-in TCP
 		// scan — only the product/version enrichment is missing this cycle.
 		log.Printf("nmap enrichment of %s failed: %v — ports are recorded from the built-in scan, just without product/version detail this cycle", sn.CIDR, err)
-		return len(seen)
+		return len(st.seen)
 	}
 	enriched := 0
 	for _, h := range nmapHosts {
-		hostID, ok := hostIDs[h.IP]
+		hostID, ok := st.hostIDs[h.IP]
 		if !ok {
 			continue
 		}
@@ -473,7 +823,7 @@ func (s *Scanner) scanSubnetNmap(ctx context.Context, sn model.Subnet, deep bool
 	}
 	log.Printf("nmap enrichment: finished for %s — %d port(s) enriched across %d host(s)", sn.CIDR, enriched, len(nmapHosts))
 
-	return len(seen)
+	return len(st.seen)
 }
 
 func (s *Scanner) scanSubnetTCP(ctx context.Context, sn model.Subnet, deep bool) int {
@@ -521,6 +871,13 @@ func (s *Scanner) scanSubnetTCP(ctx context.Context, sn model.Subnet, deep bool)
 		}(ipStr)
 	}
 	wg.Wait()
+
+	// dig -x sweep: a second pass over whatever ping/TCP/ARP above found
+	// nothing for at all. See scanUnconfirmedByDNS for why a PTR hit alone
+	// never promotes a host into seen/up the way the loop above does.
+	for ip := range s.scanUnconfirmedByDNS(ctx, unseenIPStrings(ips, seen), sn, deep) {
+		seen[ip] = true // confirmed via an open port — not "ping-only", so pingOnlyCount is untouched
+	}
 
 	if err := s.st.TouchSubnetScan(sn.ID); err != nil {
 		log.Printf("touch subnet scan: %v", err)

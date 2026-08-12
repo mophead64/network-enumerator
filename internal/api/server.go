@@ -1,8 +1,10 @@
 package api
 
 import (
+	"fmt"
 	"net"
 	"net/http"
+	"strings"
 
 	"network-enumerator/internal/auth"
 	"network-enumerator/internal/discovery"
@@ -41,6 +43,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/auth/logout", auth(s.logout))
 	mux.HandleFunc("GET /api/auth/me", auth(s.me))
 	mux.HandleFunc("POST /api/auth/change-password", auth(s.changePassword))
+	mux.HandleFunc("GET /api/auth/sessions", auth(s.activeSessions))
 
 	mux.HandleFunc("GET /api/subnets", auth(s.listSubnets))
 	mux.HandleFunc("POST /api/subnets", auth(s.createSubnet))
@@ -57,6 +60,8 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/hosts/{id}/tags/{tagId}", auth(s.removeHostTag))
 	mux.HandleFunc("POST /api/hosts/{id}/ack", auth(s.acknowledgeHost))
 	mux.HandleFunc("DELETE /api/hosts/{id}/ack", auth(s.unacknowledgeHost))
+	mux.HandleFunc("POST /api/hosts/{id}/new-ack", auth(s.acknowledgeHostNew))
+	mux.HandleFunc("POST /api/hosts/new-ack-all", auth(s.acknowledgeAllHostsNew))
 	mux.HandleFunc("POST /api/hosts/{id}/deep-scan", auth(s.deepScanHost))
 
 	mux.HandleFunc("GET /api/tags", auth(s.listTags))
@@ -72,12 +77,21 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/risk-rules/{id}", auth(s.deleteRiskRule))
 
 	mux.HandleFunc("GET /api/export/network-map", auth(s.exportNetworkMap))
+	mux.HandleFunc("POST /api/import/network-map", auth(s.importNetworkMap))
+	mux.HandleFunc("GET /api/export/system", auth(s.exportSystem))
+	mux.HandleFunc("POST /api/import/system", auth(s.importSystem))
+	mux.HandleFunc("POST /api/import/dnsrecon", auth(s.importDNSRecon))
+	mux.HandleFunc("POST /api/import/nmap", auth(s.importNmapXML))
 
 	mux.HandleFunc("GET /api/events", auth(s.listEvents))
 	mux.HandleFunc("GET /api/events/stream", auth(s.hub.ServeHTTP))
 
-	mux.HandleFunc("POST /api/scan", auth(s.triggerScan))
+	mux.HandleFunc("GET /api/tools/status", auth(s.toolStatus))
+
+	mux.HandleFunc("POST /api/scan/quick", auth(s.triggerQuickScan))
+	mux.HandleFunc("POST /api/scan/mass", auth(s.triggerMassScan))
 	mux.HandleFunc("POST /api/scan/deep", auth(s.triggerDeepScan))
+	mux.HandleFunc("POST /api/scan/reverse-dns", auth(s.triggerReverseDNSScan))
 	mux.HandleFunc("GET /api/scan/status", auth(s.scanStatus))
 }
 
@@ -121,8 +135,9 @@ func (s *Server) updateSubnet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Hidden  *bool `json:"hidden"`
-		Enabled *bool `json:"enabled"`
+		Hidden  *bool   `json:"hidden"`
+		Enabled *bool   `json:"enabled"`
+		Name    *string `json:"name"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -136,6 +151,12 @@ func (s *Server) updateSubnet(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Enabled != nil {
 		if err := s.st.SetSubnetEnabled(id, *req.Enabled); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	if req.Name != nil {
+		if err := s.st.SetSubnetName(id, *req.Name); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -210,6 +231,8 @@ func (s *Server) createHost(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, h)
 }
 
+// updateHost handles notes plus manual hostname/MAC edits — a later scan or
+// import may still overwrite either, the same as any auto-discovered value.
 func (s *Server) updateHost(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {
@@ -217,18 +240,41 @@ func (s *Server) updateHost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Notes *string `json:"notes"`
+		Notes    *string `json:"notes"`
+		Hostname *string `json:"hostname"`
+		MAC      *string `json:"mac"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+
 	if req.Notes != nil {
 		if err := s.st.UpdateHostNotes(id, *req.Notes); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 	}
+	if req.Hostname != nil {
+		if err := s.st.SetHostHostname(id, strings.TrimSpace(*req.Hostname)); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	if req.MAC != nil {
+		mac := strings.TrimSpace(*req.MAC)
+		if mac != "" {
+			if _, err := net.ParseMAC(mac); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid MAC address: "+err.Error())
+				return
+			}
+		}
+		if err := s.st.SetHostMAC(id, mac); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+
 	h, err := s.st.GetHost(id)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "host not found")
@@ -348,6 +394,42 @@ func (s *Server) unacknowledgeHost(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, h)
 }
 
+// acknowledgeHostNew dismisses a host's NEW badge for good — see
+// Store.AcknowledgeHostNew. There's no corresponding "un-acknowledge"
+// endpoint: this is meant as a one-time, one-way action.
+func (s *Server) acknowledgeHostNew(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r, "id")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	if err := s.st.AcknowledgeHostNew(id); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h, err := s.st.GetHost(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "host not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, h)
+}
+
+// acknowledgeAllHostsNew is the bulk version of acknowledgeHostNew, offered
+// from Settings — see Store.AcknowledgeAllHostsNew.
+func (s *Server) acknowledgeAllHostsNew(w http.ResponseWriter, r *http.Request) {
+	n, err := s.st.AcknowledgeAllHostsNew()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if n > 0 {
+		ev, _ := s.st.AddEvent("hosts_reviewed", fmt.Sprintf("%d host(s) marked as reviewed.", n), 0)
+		s.hub.Broadcast(ev)
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"reviewed": n})
+}
+
 func (s *Server) deepScanHost(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {
@@ -418,13 +500,52 @@ func (s *Server) listEvents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, events)
 }
 
-func (s *Server) triggerScan(w http.ResponseWriter, r *http.Request) {
-	s.scanner.TriggerNow()
+// triggerQuickScan forces the built-in TCP/ICMP prober (common ports) for
+// the next cycle, regardless of the configured scan-method setting — no
+// nmap dependency, so nothing to gate here.
+func (s *Server) triggerQuickScan(w http.ResponseWriter, r *http.Request) {
+	s.scanner.TriggerQuickScanAll()
 	writeJSON(w, http.StatusAccepted, s.scanner.Status())
 }
 
+// triggerMassScan forces an nmap sweep (common ports) across every host for
+// the next cycle. Rejected up front if nmap isn't installed — a user
+// explicitly asking for an nmap-based scan should get a clear "it's not
+// available" rather than the request silently running as a plain TCP scan
+// instead (which the regular scan-method setting can already achieve on its
+// own without pretending to be an nmap trigger).
+func (s *Server) triggerMassScan(w http.ResponseWriter, r *http.Request) {
+	if _, ok := discovery.NmapPath(); !ok {
+		writeError(w, http.StatusConflict, "nmap isn't installed on this host — mass scan requires it")
+		return
+	}
+	s.scanner.TriggerMassScanAll()
+	writeJSON(w, http.StatusAccepted, s.scanner.Status())
+}
+
+// triggerDeepScan mirrors triggerMassScan for the all-65535-ports nmap
+// sweep.
 func (s *Server) triggerDeepScan(w http.ResponseWriter, r *http.Request) {
+	if _, ok := discovery.NmapPath(); !ok {
+		writeError(w, http.StatusConflict, "nmap isn't installed on this host — deep scan requires it")
+		return
+	}
 	s.scanner.TriggerDeepScanAll()
+	writeJSON(w, http.StatusAccepted, s.scanner.Status())
+}
+
+// triggerReverseDNSScan mirrors triggerMassScan/triggerDeepScan's
+// availability gate, but for whichever reverse-DNS tool the scan cycle
+// would actually use (see Scanner.reverseDNSSweep): dnsrecon if installed,
+// otherwise dig. Only rejected if neither is available.
+func (s *Server) triggerReverseDNSScan(w http.ResponseWriter, r *http.Request) {
+	_, dnsreconOK := discovery.DnsreconPath()
+	_, digOK := discovery.DigPath()
+	if !dnsreconOK && !digOK {
+		writeError(w, http.StatusConflict, "neither dnsrecon nor dig is installed on this host — reverse DNS scan requires one of them")
+		return
+	}
+	s.scanner.TriggerReverseDNSScanAll()
 	writeJSON(w, http.StatusAccepted, s.scanner.Status())
 }
 

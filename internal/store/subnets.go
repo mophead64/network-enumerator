@@ -31,15 +31,31 @@ func (s *Store) ListSubnets() ([]model.Subnet, error) {
 	return out, rows.Err()
 }
 
-// UpsertAutoSubnet registers a subnet discovered from a local interface.
-// Returns the subnet id and whether it was newly created.
+// UpsertAutoSubnet registers a subnet discovered from a local interface, or
+// found in an imported network map (see importSegments). Returns the
+// subnet id and whether it was newly created.
+//
+// On an existing match (by CIDR), name is filled in only if the subnet
+// doesn't already have one — the same "only ever fills in what's missing"
+// rule ImportHost applies to hosts. That matters because every caller
+// shares this one upsert: the scanner and dnsrecon import always pass an
+// empty name (they have none to give), so without this check they'd never
+// touch it; but a network-map import does carry a name, and without the
+// "only if blank" guard, re-importing an old export would clobber a name
+// set since then via the rename-subnet UI or a newer import.
 func (s *Store) UpsertAutoSubnet(cidr, name, iface string) (int64, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	var id int64
-	err := s.db.QueryRow(`SELECT id FROM subnets WHERE cidr = ?`, cidr).Scan(&id)
+	var existingName string
+	err := s.db.QueryRow(`SELECT id, name FROM subnets WHERE cidr = ?`, cidr).Scan(&id, &existingName)
 	if err == nil {
+		if name != "" && existingName == "" {
+			if _, err := s.db.Exec(`UPDATE subnets SET name = ? WHERE id = ?`, name, id); err != nil {
+				return 0, false, err
+			}
+		}
 		return id, false, nil
 	}
 	if err != sql.ErrNoRows {
@@ -103,5 +119,17 @@ func (s *Store) SetSubnetEnabled(id int64, enabled bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`UPDATE subnets SET enabled = ? WHERE id = ?`, enabled, id)
+	return err
+}
+
+// SetSubnetName renames this subnet. The CIDR itself is intentionally not
+// editable anywhere — it's the identity UpsertAutoSubnet matches on to avoid
+// re-discovering the same subnet as a duplicate, and hosts reference the
+// subnet by id, not by address range, so nothing depends on being able to
+// change it after creation.
+func (s *Store) SetSubnetName(id int64, name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`UPDATE subnets SET name = ? WHERE id = ?`, name, id)
 	return err
 }

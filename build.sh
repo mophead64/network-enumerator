@@ -1,5 +1,5 @@
 BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-BUILD_VERSION="1.1.0"
+BUILD_VERSION="1.2.0"
 
 VERSION_LDFLAGS="-X network-enumerator/internal/version.Version=${BUILD_VERSION} -X network-enumerator/internal/version.BuildDate=${BUILD_DATE}"
 

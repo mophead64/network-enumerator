@@ -59,6 +59,107 @@ func (s *Store) UpsertHost(subnetID int64, ip, mac, hostname, vendor string) (id
 	return id, true, err
 }
 
+// UpsertUnconfirmedHost records a host seen only via a passive signal — a
+// dig -x PTR record with no ping/TCP/ARP response to back it up — rather
+// than a live probe. Unlike UpsertHost, an existing row's status/miss_count/
+// last_seen are never touched here: a PTR record is a static DNS entry that
+// persists whether or not the device behind it is even powered on, so it
+// must never be able to promote a host to "up" (or protect one from ever
+// going "down") by itself. A brand-new row is inserted with status
+// "unknown" — neither "up" nor "down" — until an open port actually
+// confirms it via ConfirmHostUp. Returns the host id and whether this is the
+// first time the host has ever been seen.
+func (s *Store) UpsertUnconfirmedHost(subnetID int64, ip, hostname string) (id int64, isNew bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var existingHostname string
+	err = s.db.QueryRow(`SELECT id, hostname FROM hosts WHERE subnet_id = ? AND ip = ?`, subnetID, ip).Scan(&id, &existingHostname)
+	if err == nil {
+		if hostname != "" && existingHostname == "" {
+			_, err = s.db.Exec(`UPDATE hosts SET hostname = ? WHERE id = ?`, hostname, id)
+		}
+		return id, false, err
+	}
+	if err != sql.ErrNoRows {
+		return 0, false, err
+	}
+
+	now := time.Now()
+	res, err := s.db.Exec(`INSERT INTO hosts (subnet_id, ip, hostname, status, source, first_seen, last_seen, miss_count)
+		VALUES (?, ?, ?, 'unknown', 'auto', ?, ?, 0)`, subnetID, ip, hostname, now, now)
+	if err != nil {
+		return 0, false, err
+	}
+	id, err = res.LastInsertId()
+	return id, true, err
+}
+
+// ConfirmHostUp promotes a host recorded via UpsertUnconfirmedHost to a
+// genuinely confirmed "up" once a port scan finds an open port on it — the
+// real liveness proof a PTR record alone can never provide.
+func (s *Store) ConfirmHostUp(id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`UPDATE hosts SET status = 'up', miss_count = 0, last_seen = ? WHERE id = ?`, time.Now(), id)
+	return err
+}
+
+// ImportHost records a host from a previously-exported network map — the
+// "I lost my database, but I have last week's export" recovery path.
+// Like UpsertUnconfirmedHost, this is a historical record rather than a
+// live probe result, so a brand-new row lands with status "unknown" rather
+// than "up": the export is a snapshot of what was once true, and only the
+// scan cycle that follows the import (or a later one) can actually confirm
+// it. An existing row — already discovered by this session's own scanning,
+// or a previous import — is left with whatever status/miss_count/last_seen
+// it already has; only its empty mac/hostname/vendor fields are filled in,
+// and notes are only ever set on first import so a re-import can't clobber
+// notes added since. Returns the host id and whether this is the first
+// time the host has ever been seen.
+func (s *Store) ImportHost(subnetID int64, ip, mac, hostname, vendor, notes string) (id int64, isNew bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var existingMAC, existingHostname, existingVendor string
+	err = s.db.QueryRow(`SELECT id, mac, hostname, vendor FROM hosts WHERE subnet_id = ? AND ip = ?`, subnetID, ip).
+		Scan(&id, &existingMAC, &existingHostname, &existingVendor)
+	if err == nil {
+		var sets []string
+		var args []any
+		if mac != "" && existingMAC == "" {
+			sets = append(sets, "mac = ?")
+			args = append(args, mac)
+		}
+		if hostname != "" && existingHostname == "" {
+			sets = append(sets, "hostname = ?")
+			args = append(args, hostname)
+		}
+		if vendor != "" && existingVendor == "" {
+			sets = append(sets, "vendor = ?")
+			args = append(args, vendor)
+		}
+		if len(sets) == 0 {
+			return id, false, nil
+		}
+		args = append(args, id)
+		_, err = s.db.Exec(`UPDATE hosts SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...)
+		return id, false, err
+	}
+	if err != sql.ErrNoRows {
+		return 0, false, err
+	}
+
+	now := time.Now()
+	res, err := s.db.Exec(`INSERT INTO hosts (subnet_id, ip, mac, hostname, vendor, status, source, notes, first_seen, last_seen, miss_count)
+		VALUES (?, ?, ?, ?, ?, 'unknown', 'auto', ?, ?, ?, 0)`, subnetID, ip, mac, hostname, vendor, notes, now, now)
+	if err != nil {
+		return 0, false, err
+	}
+	id, err = res.LastInsertId()
+	return id, true, err
+}
+
 func (s *Store) AddManualHost(subnetID int64, ip, hostname, notes string) (model.Host, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -82,6 +183,24 @@ func (s *Store) UpdateHostNotes(id int64, notes string) error {
 	return err
 }
 
+// SetHostHostname manually sets a host's hostname (e.g. via the host
+// modal) — a later scan/import may still overwrite it, the same as any
+// auto-discovered value.
+func (s *Store) SetHostHostname(id int64, hostname string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`UPDATE hosts SET hostname = ? WHERE id = ?`, hostname, id)
+	return err
+}
+
+// SetHostMAC manually sets a host's MAC address — mirrors SetHostHostname.
+func (s *Store) SetHostMAC(id int64, mac string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`UPDATE hosts SET mac = ? WHERE id = ?`, mac, id)
+	return err
+}
+
 // AcknowledgeHost exempts a host from priority triage views until its open
 // ports change again.
 func (s *Store) AcknowledgeHost(id int64) error {
@@ -96,6 +215,33 @@ func (s *Store) UnacknowledgeHost(id int64) error {
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`UPDATE hosts SET acknowledged = 0 WHERE id = ?`, id)
 	return err
+}
+
+// AcknowledgeHostNew dismisses this host's NEW badge for good. Unlike
+// AcknowledgeHost (priority triage, auto-cleared the moment a new port
+// opens), this is a one-time, one-way acknowledgement: nothing ever flips
+// new_ack back to 0, and a host's "new" status no longer expires on its own
+// after a fixed window — see IsNew in ListHosts/GetHost.
+func (s *Store) AcknowledgeHostNew(id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`UPDATE hosts SET new_ack = 1 WHERE id = ?`, id)
+	return err
+}
+
+// AcknowledgeAllHostsNew is the bulk version of AcknowledgeHostNew — dismisses
+// the NEW badge for every host at once, offered from Settings for clearing a
+// backlog in one action rather than host by host. Returns how many hosts
+// were actually still new (and so got touched).
+func (s *Store) AcknowledgeAllHostsNew() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(`UPDATE hosts SET new_ack = 1 WHERE new_ack = 0`)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
 }
 
 // ClearAcknowledgementIfSet un-acknowledges a host and reports whether it
@@ -166,7 +312,10 @@ func (s *Store) SweepMissingHosts(subnetID int64, seenIPs map[string]bool, thres
 	for _, r := range candidates {
 		missCount := r.missCount + 1
 		status := r.status
-		if missCount >= threshold && status != "down" {
+		// Only a confirmed "up" host can go "down" — "unknown" hosts (dig -x
+		// PTR only, never an open port) were never actually confirmed alive,
+		// so missing them again and again is expected, not a state change.
+		if missCount >= threshold && status == "up" {
 			status = "down"
 			justWentDown = append(justWentDown, r.id)
 		}
@@ -179,7 +328,7 @@ func (s *Store) SweepMissingHosts(subnetID int64, seenIPs map[string]bool, thres
 
 func (s *Store) ListHosts() ([]model.Host, error) {
 	s.mu.Lock()
-	hostRows, err := s.db.Query(`SELECT id, subnet_id, ip, mac, hostname, vendor, status, source, notes, first_seen, last_seen, acknowledged FROM hosts ORDER BY subnet_id, ip`)
+	hostRows, err := s.db.Query(`SELECT id, subnet_id, ip, mac, hostname, vendor, status, source, notes, first_seen, last_seen, acknowledged, new_ack FROM hosts ORDER BY subnet_id, ip`)
 	if err != nil {
 		s.mu.Unlock()
 		return nil, err
@@ -187,12 +336,13 @@ func (s *Store) ListHosts() ([]model.Host, error) {
 	hosts := []model.Host{}
 	for hostRows.Next() {
 		var h model.Host
-		if err := hostRows.Scan(&h.ID, &h.SubnetID, &h.IP, &h.MAC, &h.Hostname, &h.Vendor, &h.Status, &h.Source, &h.Notes, &h.FirstSeen, &h.LastSeen, &h.Acknowledged); err != nil {
+		var newAck bool
+		if err := hostRows.Scan(&h.ID, &h.SubnetID, &h.IP, &h.MAC, &h.Hostname, &h.Vendor, &h.Status, &h.Source, &h.Notes, &h.FirstSeen, &h.LastSeen, &h.Acknowledged, &newAck); err != nil {
 			hostRows.Close()
 			s.mu.Unlock()
 			return nil, err
 		}
-		h.IsNew = time.Since(h.FirstSeen) < newHighlightWindow
+		h.IsNew = !newAck
 		hosts = append(hosts, h)
 	}
 	hostRows.Close()
@@ -231,8 +381,9 @@ func (s *Store) ListHosts() ([]model.Host, error) {
 func (s *Store) GetHost(id int64) (model.Host, error) {
 	s.mu.Lock()
 	var h model.Host
-	err := s.db.QueryRow(`SELECT id, subnet_id, ip, mac, hostname, vendor, status, source, notes, first_seen, last_seen, acknowledged FROM hosts WHERE id = ?`, id).
-		Scan(&h.ID, &h.SubnetID, &h.IP, &h.MAC, &h.Hostname, &h.Vendor, &h.Status, &h.Source, &h.Notes, &h.FirstSeen, &h.LastSeen, &h.Acknowledged)
+	var newAck bool
+	err := s.db.QueryRow(`SELECT id, subnet_id, ip, mac, hostname, vendor, status, source, notes, first_seen, last_seen, acknowledged, new_ack FROM hosts WHERE id = ?`, id).
+		Scan(&h.ID, &h.SubnetID, &h.IP, &h.MAC, &h.Hostname, &h.Vendor, &h.Status, &h.Source, &h.Notes, &h.FirstSeen, &h.LastSeen, &h.Acknowledged, &newAck)
 	if err != nil {
 		s.mu.Unlock()
 		return h, err
@@ -250,7 +401,7 @@ func (s *Store) GetHost(id int64) (model.Host, error) {
 		return h, err
 	}
 
-	h.IsNew = time.Since(h.FirstSeen) < newHighlightWindow
+	h.IsNew = !newAck
 	applySuspectFlag(&h, macCount)
 	h.Tags, err = s.tagsForHost(h.ID)
 	if err != nil {

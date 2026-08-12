@@ -91,13 +91,11 @@ function networkCIDR(ip, prefix) {
   return intToIp((n & mask) >>> 0) + "/" + prefix;
 }
 
-/** Groups hosts one bucketing level below `prefix`, the same rule the
- * canvas graph's Graph._layoutLevel uses (stepping in octets, capped at
- * /24 where individual hosts show instead of another bucket layer) — kept
- * as a separate pure function (no canvas/positioning) so the simple-view
- * tree can reuse the exact same grouping without depending on the Graph
- * class. Returns null at a leaf level (prefix >= 24 or unknown), meaning
- * "render these hosts directly, no further grouping". */
+/** Groups hosts one bucketing level below `prefix` — stepping in octets,
+ * capped at /24 where individual hosts show instead of another bucket
+ * layer — used by Graph._layoutLevel. Returns null at a leaf level
+ * (prefix >= 24 or unknown), meaning "render these hosts directly, no
+ * further grouping". */
 function nextTreeLevel(hosts, prefix) {
   if (prefix === null || prefix >= 24) return null;
   const childPrefix = nextBucketPrefix(prefix);
@@ -149,16 +147,18 @@ const Api = {
   me: () => Api._req("GET", "/api/auth/me"),
   changePassword: (currentPassword, newUsername, newPassword) =>
     Api._req("POST", "/api/auth/change-password", { currentPassword, newUsername, newPassword }),
+  activeSessions: () => Api._req("GET", "/api/auth/sessions"),
 
   subnets: () => Api._req("GET", "/api/subnets"),
   addSubnet: (cidr, name) => Api._req("POST", "/api/subnets", { cidr, name }),
+  renameSubnet: (id, name) => Api._req("PATCH", `/api/subnets/${id}`, { name }),
   setSubnetHidden: (id, hidden) => Api._req("PATCH", `/api/subnets/${id}`, { hidden }),
   setSubnetEnabled: (id, enabled) => Api._req("PATCH", `/api/subnets/${id}`, { enabled }),
   deleteSubnet: (id) => Api._req("DELETE", `/api/subnets/${id}`),
 
   hosts: () => Api._req("GET", "/api/hosts"),
   addHost: (subnetId, ip, hostname, notes) => Api._req("POST", "/api/hosts", { subnetId, ip, hostname, notes }),
-  updateHostNotes: (id, notes) => Api._req("PATCH", `/api/hosts/${id}`, { notes }),
+  updateHost: (id, fields) => Api._req("PATCH", `/api/hosts/${id}`, fields),
   deleteHost: (id) => Api._req("DELETE", `/api/hosts/${id}`),
   clearAllHosts: (confirm) => Api._req("DELETE", `/api/hosts?confirm=${encodeURIComponent(confirm)}`),
   addHostTag: (hostId, tagId) => Api._req("POST", `/api/hosts/${hostId}/tags`, { tagId }),
@@ -170,6 +170,8 @@ const Api = {
 
   ackHost: (id) => Api._req("POST", `/api/hosts/${id}/ack`),
   unackHost: (id) => Api._req("DELETE", `/api/hosts/${id}/ack`),
+  ackHostNew: (id) => Api._req("POST", `/api/hosts/${id}/new-ack`),
+  ackAllHostsNew: () => Api._req("POST", "/api/hosts/new-ack-all"),
   deepScanHost: (id) => Api._req("POST", `/api/hosts/${id}/deep-scan`),
 
   riskRules: () => Api._req("GET", "/api/risk-rules"),
@@ -184,9 +186,34 @@ const Api = {
   updateSettings: (scanMethod) => Api._req("PATCH", "/api/settings", { scanMethod }),
   updateNetdiscoverEnabled: (netdiscoverEnabled) => Api._req("PATCH", "/api/settings", { netdiscoverEnabled }),
 
+  importNetworkMap: (doc) => Api._req("POST", "/api/import/network-map", doc),
+  importSystem: (doc) => Api._req("POST", "/api/import/system", doc),
+  importDnsRecon: (records) => Api._req("POST", "/api/import/dnsrecon", records),
+  // Raw XML, not JSON — bypasses _req's JSON.stringify/Content-Type: application/json.
+  importNmapXml: async (xmlText) => {
+    const res = await fetch("/api/import/nmap", {
+      method: "POST",
+      headers: { "Content-Type": "text/xml" },
+      body: xmlText,
+    });
+    if (res.status === 401 && !AUTH_EXEMPT_PATHS.has("/api/import/nmap")) {
+      if (!suppressSessionExpiry) showLoginScreen();
+      throw new Error("Session expired — please sign in again.");
+    }
+    if (!res.ok) {
+      let msg = res.statusText;
+      try { msg = (await res.json()).error || msg; } catch (_) { /* ignore */ }
+      throw new Error(msg);
+    }
+    return res.json();
+  },
+
   events: () => Api._req("GET", "/api/events"),
-  scanNow: () => Api._req("POST", "/api/scan"),
+  toolStatus: () => Api._req("GET", "/api/tools/status"),
+  quickScanAll: () => Api._req("POST", "/api/scan/quick"),
+  massScanAll: () => Api._req("POST", "/api/scan/mass"),
   deepScanAll: () => Api._req("POST", "/api/scan/deep"),
+  reverseDnsScanAll: () => Api._req("POST", "/api/scan/reverse-dns"),
   scanStatus: () => Api._req("GET", "/api/scan/status"),
 };
 
@@ -203,25 +230,24 @@ const state = {
   selectedHostId: null,
   filters: { search: "", status: "", newOnly: false, subnetId: "", risk: "", hideSuspect: false, priorityOnly: false, tagIds: new Set(), showHiddenSubnets: false },
   sortBy: "priority",
-  // Bucket keys expanded in either graph view — shared between the
-  // animated canvas and the static one, so expanding a bucket in one is
-  // reflected in the other.
+  // Bucket keys expanded in the graph (a subnet bigger than /24 groups its
+  // hosts into buckets — see Graph._layoutLevel — until clicked open).
   expandedBuckets: new Set(),
-  // Subnet keys collapsed in either graph view — inverse sense of
-  // expandedBuckets (subnets default to expanded, so this tracks the
-  // exception), but otherwise the same shared-between-both-views deal.
+  // Subnet keys collapsed in the graph — inverse sense of expandedBuckets
+  // (subnets default to expanded, so this tracks the exception).
   collapsedSubnets: new Set(),
   notifDismissed: new Set(), // event ids the user has cleared from the bell panel
   notifUnread: new Set(), // event ids not yet seen (drives the bell badge count)
   pendingTagAdds: [], // staged in the host modal until Save is clicked
   pendingTagRemoves: [],
-  // "graph" | "simple" — simple view swaps the physics-animated canvas for
-  // a second canvas showing the same segments > hosts hierarchy laid out
-  // as a static tree (deterministic positions, draw-on-demand instead of a
-  // continuous per-frame loop). For remote/thin-client sessions where that
-  // continuous redraw is heavy or laggy. Persisted per browser, not per
-  // account, since it's about the viewing hardware.
-  viewMode: localStorage.getItem("viewMode") === "simple" ? "simple" : "graph",
+  // "graph" | "table" — table view swaps the animated canvas out entirely
+  // for a searchable, expandable subnet/host table. Persisted per browser,
+  // not per account, since it's about viewing preference.
+  viewMode: localStorage.getItem("viewMode") === "table" ? "table" : "graph",
+  // Subnet ids expanded in the table view — independent of the graph's
+  // collapsedSubnets (opposite default: table rows start collapsed, so
+  // this tracks which ones the user opened, not which they closed).
+  tableExpandedSubnets: new Set(),
 };
 
 function subnetById(id) { return state.subnets.find((s) => s.id === id); }
@@ -235,15 +261,11 @@ function tagById(id) { return state.tags.find((t) => t.id === id); }
 const TAG_PALETTE = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"];
 
 class Graph {
-  /** animated (default true) picks the physics-simulated layout used by
-   * the main graph view. Passing false gives the simple-view graph: same
-   * node/link model, same pan/zoom/drag/click-to-expand interactions, but
-   * positions come from a one-shot deterministic tree layout (see
-   * _syncStatic) instead of a spring simulation, and wake() draws once on
-   * demand instead of starting a continuous requestAnimationFrame loop. */
-  constructor(canvas, opts = {}) {
+  static ZOOM_MIN = 0.15;
+  static ZOOM_MAX = 4;
+
+  constructor(canvas) {
     this.canvas = canvas;
-    this.animated = opts.animated !== false;
     this.ctx = canvas.getContext("2d");
     this.nodes = new Map(); // key -> node
     this.links = [];
@@ -341,13 +363,33 @@ class Graph {
   _onWheel(e) {
     e.preventDefault();
     const rect = this.canvas.getBoundingClientRect();
-    const sx = e.clientX - rect.left, sy = e.clientY - rect.top;
+    this._zoomAt(e.clientX - rect.left, e.clientY - rect.top, Math.exp(-e.deltaY * 0.001));
+  }
+
+  /** Zooms by factor around the screen point (sx, sy) so that point stays
+   * under the cursor — shared by scroll-to-zoom (_onWheel, screen point =
+   * cursor) and the +/- zoom buttons (zoomBy, screen point = canvas center,
+   * for users who'd rather click than scroll/pinch). */
+  _zoomAt(sx, sy, factor) {
     const before = this.screenToWorld(sx, sy);
-    const factor = Math.exp(-e.deltaY * 0.001);
-    this.transform.k = Math.min(4, Math.max(0.15, this.transform.k * factor));
+    this.transform.k = Math.min(Graph.ZOOM_MAX, Math.max(Graph.ZOOM_MIN, this.transform.k * factor));
     const after = this.screenToWorld(sx, sy);
     this.transform.x += (after.x - before.x) * this.transform.k;
     this.transform.y += (after.y - before.y) * this.transform.k;
+    this.wake();
+  }
+
+  /** Zooms in (factor > 1) or out (factor < 1) centered on the canvas —
+   * the +/- zoom buttons' handler. */
+  zoomBy(factor) {
+    this._zoomAt(this.width / 2, this.height / 2, factor);
+  }
+
+  /** Restores the default 1:1 zoom, centered — the "reset zoom" button. */
+  resetZoom() {
+    this.transform.x = this.width / 2;
+    this.transform.y = this.height / 2;
+    this.transform.k = 1;
     this.wake();
   }
 
@@ -368,23 +410,17 @@ class Graph {
     if (n) { n.pinned = false; this.wake(); }
   }
 
-  /** Animated: (re)starts the physics/redraw loop if it isn't already
-   * running. Static: there's no loop to start — every wake() is a single
-   * immediate redraw, since positions only ever change from an explicit
-   * sync()/drag/pan/zoom, never from a settling simulation. Either way,
-   * paused suppresses it completely: the point of the static view is that
-   * a client with weak video acceleration pays for a redraw only when
-   * something actually visibly changed, never on a timer. */
+  /** (Re)starts the physics/redraw loop if it isn't already running.
+   * paused suppresses it completely — see setPaused. */
   wake() {
     this._sleepFrames = 0;
     if (this.paused) return;
-    if (!this.animated) { this._draw(); return; }
     if (!this.running) { this.running = true; requestAnimationFrame(() => this._tick()); }
   }
 
   /** Pausing stops the physics/redraw loop outright — wake() becomes a
-   * no-op rather than just hiding the canvas — so whichever view isn't
-   * currently shown genuinely costs nothing, instead of continuing to
+   * no-op rather than just hiding the canvas — so table view (which shows
+   * neither this canvas) genuinely costs nothing, instead of continuing to
    * repaint an invisible element. Unpausing wakes it so the (possibly
    * stale, since sync() was still updating the node/link data underneath)
    * layout redraws immediately. */
@@ -444,12 +480,8 @@ class Graph {
   }
 
   /** Rebuild node/link set from current subnets+hosts, preserving positions
-   * of nodes that still exist. Static graphs use a completely different
-   * (non-physics) layout algorithm — see _syncStatic — since there's no
-   * simulation running to spread freshly-seeded nodes apart. */
+   * of nodes that still exist. */
   sync(subnets, hosts) {
-    if (!this.animated) { this._syncStatic(subnets, hosts); return; }
-
     const nextKeys = new Set();
     const cx = 0, cy = 0;
 
@@ -484,102 +516,6 @@ class Graph {
         this._layoutLevel(subnetKey, subnetHosts, cidrPrefix(sn.cidr), sn.id, nextKeys, cx, cy);
       }
     }
-
-    for (const key of Array.from(this.nodes.keys())) {
-      if (!nextKeys.has(key)) this.nodes.delete(key);
-    }
-
-    this.wake();
-  }
-
-  /** Builds a plain-object tree (subnet -> bucket* -> host) describing
-   * what should be visible under key given the current bucket-expansion
-   * state, with no canvas/positioning concerns mixed in — the static
-   * layout's equivalent of what _layoutLevel does while it recurses, but
-   * as a separate pass since the tree layout below needs the whole shape
-   * (to compute subtree widths) before it can place anything, unlike the
-   * physics layout which only needs a rough starting point per node.
-   * Subnets expand unless collapsed via state.collapsedSubnets; buckets
-   * expand only via the same state.expandedBuckets the animated view's
-   * bucket click-to-expand uses — both sets are shared between views. */
-  _buildLogicalTree(key, type, data, hosts, prefix, subnetId) {
-    const node = { key, type, data, subnetId, children: [] };
-    if (type === "host") return node;
-
-    node.count = hosts.length;
-    node.expanded = type === "subnet" ? !state.collapsedSubnets.has(key) : state.expandedBuckets.has(key);
-    if (node.expanded) {
-      const level = nextTreeLevel(hosts, prefix);
-      node.children = !level
-        ? hosts.map((h) => this._buildLogicalTree("host:" + h.id, "host", h, null, null, null))
-        : Array.from(level.groups.entries())
-          .sort((a, b) => a[0].localeCompare(b[0]))
-          .map(([cidr, groupHosts]) => this._buildLogicalTree(
-            "bucket:" + subnetId + ":" + cidr, "bucket", { cidr }, groupHosts, level.childPrefix, subnetId));
-    }
-    return node;
-  }
-
-  /** Static-view equivalent of sync(): lays out the same segments > hosts
-   * hierarchy as a top-down tree instead of a physics simulation. Depth
-   * comes straight from tree depth; horizontal position comes from a
-   * simple two-pass scheme — leaves get sequential slots left to right,
-   * each internal node centers over its children's slots — which is all
-   * that's needed since (unlike the animated view) nothing has to spread
-   * newly-added nodes apart after the fact. Positions are only assigned to
-   * brand-new nodes; anything the user already dragged keeps its place
-   * across re-syncs, same as pinning does in the animated view. */
-  _syncStatic(subnets, hosts) {
-    const bySubnet = new Map();
-    hosts.forEach((h) => {
-      if (!bySubnet.has(h.subnetId)) bySubnet.set(h.subnetId, []);
-      bySubnet.get(h.subnetId).push(h);
-    });
-
-    const roots = subnets.map((sn) => this._buildLogicalTree(
-      "subnet:" + sn.id, "subnet", sn, bySubnet.get(sn.id) || [], cidrPrefix(sn.cidr), sn.id));
-
-    const leafCounter = { n: 0 };
-    const assignSlots = (node, depth) => {
-      node.depth = depth;
-      if (node.children.length === 0) {
-        node.tx = leafCounter.n++;
-        return;
-      }
-      node.children.forEach((c) => assignSlots(c, depth + 1));
-      const txs = node.children.map((c) => c.tx);
-      node.tx = (Math.min(...txs) + Math.max(...txs)) / 2;
-    };
-    roots.forEach((root) => assignSlots(root, 0));
-
-    const spacingX = 70, spacingY = 90;
-    const offsetX = -Math.max(0, (leafCounter.n - 1) * spacingX) / 2;
-
-    const nextKeys = new Set();
-    const place = (node, parentKey) => {
-      nextKeys.add(node.key);
-      const r = node.type === "subnet" ? 16 : node.type === "bucket" ? 14 : 7;
-      const cn = this._ensureNode(node.key, () => ({
-        key: node.key, type: node.type, r, vx: 0, vy: 0, pinned: false,
-        hostId: node.type === "host" ? node.data.id : undefined,
-        x: node.tx * spacingX + offsetX, y: node.depth * spacingY,
-      }));
-      cn.data = node.data;
-      if (node.type === "bucket") {
-        cn.subnetId = node.subnetId;
-        cn.cidr = node.data.cidr;
-        cn.count = node.count;
-        cn.expanded = node.expanded;
-      } else if (node.type === "subnet") {
-        cn.count = node.count;
-        cn.expanded = node.expanded;
-      }
-      if (parentKey) this.links.push({ a: parentKey, b: node.key });
-      node.children.forEach((c) => place(c, node.key));
-    };
-
-    this.links = [];
-    roots.forEach((root) => place(root, null));
 
     for (const key of Array.from(this.nodes.keys())) {
       if (!nextKeys.has(key)) this.nodes.delete(key);
@@ -735,10 +671,10 @@ class Graph {
         ctx.textBaseline = "alphabetic";
         ctx.restore();
         if (this.transform.k > 0.35) {
-          ctx.fillStyle = muted;
+          ctx.fillStyle = node.count ? muted : warning;
           ctx.font = `${11 / this.transform.k}px system-ui, sans-serif`;
           ctx.textAlign = "center";
-          const label = node.data ? `${node.data.cidr} (${node.count || 0})` : "";
+          const label = node.data ? subnetGraphLabel(node.data, node.count) : "";
           ctx.fillText(label, node.x, node.y - node.r - 6 / this.transform.k);
         }
         continue;
@@ -771,11 +707,17 @@ class Graph {
       }
 
       const h = node.data;
-      const color = !h ? muted : h.status === "down" ? critical : good;
+      let color = muted;
+      let alpha = 1;
+      if (h) {
+        if (h.status === "down") { color = critical; alpha = 0.55; }
+        else if (h.status === "unknown") { color = muted; alpha = 0.75; }
+        else { color = good; }
+      }
       ctx.beginPath();
       ctx.arc(node.x, node.y, node.r, 0, Math.PI * 2);
       ctx.fillStyle = color;
-      ctx.globalAlpha = h && h.status === "down" ? 0.55 : 1;
+      ctx.globalAlpha = alpha;
       ctx.fill();
       ctx.globalAlpha = 1;
 
@@ -814,8 +756,7 @@ class Graph {
   }
 }
 
-let graph; // animated, physics-simulated
-let simpleGraph; // static tree layout, for simple view
+let graph;
 
 /* ---------------------------------------------------------------------- */
 /* rendering                                                              */
@@ -877,6 +818,35 @@ function graphSubnets() {
   return subnets;
 }
 
+/** Graph label for a subnet node: its name (if set) prefixed onto the CIDR,
+ * followed by its host count — see Graph._draw's subnet branch. */
+function subnetGraphLabel(sn, count) {
+  const prefix = sn.name ? `${sn.name} — ` : "";
+  return `${prefix}${sn.cidr} (${count || 0})`;
+}
+
+/** Host modal's "Subnet" field: name plus CIDR if the subnet has one, just
+ * the CIDR otherwise — see openHostModal. */
+function subnetDisplayLabel(sn) {
+  if (!sn) return "—";
+  return sn.name ? `${sn.name} (${sn.cidr})` : sn.cidr;
+}
+
+/** "unknown" hosts were found only via a dig -x PTR record — no ping/TCP/ARP
+ * response and no confirmed open port yet — so they're neither up (green)
+ * nor down (red), just unconfirmed (muted). */
+function statusColorVar(status) {
+  if (status === "down") return "var(--status-critical)";
+  if (status === "unknown") return "var(--text-muted)";
+  return "var(--status-good)";
+}
+
+function statusPillClass(status) {
+  if (status === "down") return "pill-bad";
+  if (status === "unknown") return "pill-muted";
+  return "pill-good";
+}
+
 const RISK_LABEL = { critical: "CRITICAL", warning: "WARNING", info: "INFO" };
 
 function riskBadge(level, reasons, acknowledged) {
@@ -919,7 +889,7 @@ function renderHostList() {
     const sn = subnetById(h.subnetId);
     const openPortCount = (h.ports || []).filter((p) => p.state === "open").length;
     const row = el("div", { class: "host-row", onclick: () => openHostModal(h.id) }, [
-      el("span", { class: "status-dot", style: `background:${h.status === "down" ? "var(--status-critical)" : "var(--status-good)"}` }),
+      el("span", { class: "status-dot", style: `background:${statusColorVar(h.status)}` }),
       el("div", { class: "host-main" }, [
         el("div", { class: "host-ip" }, [h.ip + (h.hostname ? "  " : ""), h.hostname ? el("span", { class: "muted", text: h.hostname }) : null]),
         el("div", { class: "host-sub" }, [sn ? sn.cidr : "", openPortCount ? ` · ${openPortCount} open port${openPortCount === 1 ? "" : "s"}` : ""]),
@@ -927,6 +897,7 @@ function renderHostList() {
       ...(h.tags || []).slice(0, 3).map((t) => el("span", { class: "tag-dot", style: `background:${t.color}`, title: t.name })),
       h.riskLevel ? riskBadge(h.riskLevel, h.riskReasons, h.acknowledged) : null,
       h.suspect ? el("span", { class: "badge-suspect", title: h.suspectReason, text: "SUSPECT" }) : null,
+      h.status === "unknown" ? el("span", { class: "badge-unconfirmed", title: "Found via reverse DNS only — not yet confirmed by ping/TCP/ARP or an open port", text: "UNCONFIRMED" }) : null,
       h.isNew ? el("span", { class: "badge-new", text: "NEW" }) : null,
     ]);
     list.appendChild(row);
@@ -1011,12 +982,93 @@ function renderSubnetList() {
             class: "btn-icon", title: sn.hidden ? "Unhide subnet — show its hosts again" : "Hide subnet — suppress its hosts from the list, graph, and counts",
             onclick: async () => { await Api.setSubnetHidden(sn.id, !sn.hidden); await refreshSubnets(); },
           }, [sn.hidden ? "👁" : "🙈"]),
+          el("button", { class: "btn-icon", title: "Rename subnet", onclick: () => openSubnetModal(sn) }, ["✎"]),
           el("button", { class: "btn-icon", title: "Remove subnet", onclick: () => removeSubnet(sn.id) }, ["✕"]),
         ]),
       ]),
       el("div", { class: "sc-meta", text: `${sn.name ? sn.name + " · " : ""}${sn.source} · ${count} host${count === 1 ? "" : "s"} · scanned ${timeAgo(sn.lastScanAt)}` }),
     ]));
   }
+}
+
+function toggleTableSubnet(id) {
+  if (state.tableExpandedSubnets.has(id)) state.tableExpandedSubnets.delete(id);
+  else state.tableExpandedSubnets.add(id);
+  renderTableView();
+}
+
+/** The data cells for one host — Status, IP, Hostname, Open ports, Flags,
+ * Last seen — used by a subnet's expanded sub-rows (hostSubRow). Subnet
+ * itself is omitted since hostSubRow's parent row already says which
+ * subnet it is. */
+function hostRowCells(h) {
+  const openPorts = (h.ports || []).filter((p) => p.state === "open").map((p) => p.port).sort((a, b) => a - b);
+  return [
+    el("td", {}, [el("span", { class: "status-dot", style: `background:${statusColorVar(h.status)}` }), " " + statusLabel(h.status)]),
+    el("td", { class: "host-ip" }, [h.ip]),
+    el("td", {}, [h.hostname || "—"]),
+    el("td", {}, [openPorts.length ? openPorts.join(", ") : "—"]),
+    el("td", {}, [
+      h.riskLevel ? riskBadge(h.riskLevel, h.riskReasons, h.acknowledged) : null,
+      h.suspect ? el("span", { class: "badge-suspect", title: h.suspectReason, text: "SUSPECT" }) : null,
+      h.isNew ? el("span", { class: "badge-new", text: "NEW" }) : null,
+    ]),
+    el("td", { class: "muted small" }, [timeAgo(h.lastSeen)]),
+  ];
+}
+
+/** One host, nested under its expanded subnet row in the subnets table.
+ * Deliberately shows every host in the subnet regardless of the table's
+ * own search/subnet filter — expanding a specific subnet is a direct
+ * request to see everything in it, not something a stale search term
+ * should be able to empty out. */
+function hostSubRow(h) {
+  return el("tr", { class: "host-subrow", onclick: () => openHostModal(h.id) }, [
+    el("td", {}, []),
+    ...hostRowCells(h),
+  ]);
+}
+
+/** Subnets table: one row per subnet with a live up/down/unconfirmed
+ * breakdown, click to expand its hosts inline (see hostSubRow) — the
+ * "table view of subnets, which can then be expanded into hosts" half of
+ * table view. */
+function renderSubnetsTable() {
+  const tbody = qs("#subnetsTableBody");
+  if (!tbody) return;
+  tbody.innerHTML = "";
+  if (state.subnets.length === 0) {
+    tbody.appendChild(el("tr", {}, [el("td", { colspan: "7", class: "muted small", style: "padding:16px;" }, ["No subnets yet."])]));
+    return;
+  }
+  for (const sn of state.subnets) {
+    const snHosts = state.hosts.filter((h) => h.subnetId === sn.id);
+    const up = snHosts.filter((h) => h.status === "up").length;
+    const down = snHosts.filter((h) => h.status === "down").length;
+    const unknown = snHosts.filter((h) => h.status === "unknown").length;
+    const expanded = state.tableExpandedSubnets.has(sn.id);
+    tbody.appendChild(el("tr", { class: "subnet-row" + (sn.hidden ? " subnet-row-hidden" : ""), onclick: () => toggleTableSubnet(sn.id) }, [
+      el("td", { class: "expand-cell" }, [expanded ? "▾" : "▸"]),
+      el("td", {}, [subnetDisplayLabel(sn), sn.hidden ? el("span", { class: "badge-suspect", text: "HIDDEN" }) : null]),
+      el("td", {}, [String(snHosts.length)]),
+      el("td", {}, [String(up)]),
+      el("td", {}, [String(down)]),
+      el("td", {}, [String(unknown)]),
+      el("td", { class: "muted small" }, [timeAgo(sn.lastScanAt)]),
+    ]));
+    if (!expanded) continue;
+    if (snHosts.length === 0) {
+      tbody.appendChild(el("tr", { class: "host-subrow" }, [el("td", {}, []), el("td", { colspan: "6", class: "muted small" }, ["No hosts in this subnet."])]));
+    } else {
+      for (const h of snHosts.slice().sort((a, b) => a.ip.localeCompare(b.ip, undefined, { numeric: true }))) {
+        tbody.appendChild(hostSubRow(h));
+      }
+    }
+  }
+}
+
+function renderTableView() {
+  renderSubnetsTable();
 }
 
 function renderTagSelects() {
@@ -1070,7 +1122,7 @@ function renderSubnetFilterOptions() {
 function renderGraph() {
   const subnets = graphSubnets(), hosts = filteredHosts();
   if (graph) graph.sync(subnets, hosts);
-  if (simpleGraph) simpleGraph.sync(subnets, hosts);
+  renderTableView();
 }
 
 function renderAll() {
@@ -1113,7 +1165,30 @@ function openHostModal(hostId) {
     ]));
   }
 
-  const ackInfoTip = "Marking as checked means you've reviewed this host, so it drops out of priority views (the ⚑ filter, the dashboard's priority count) until something changes. It's automatically un-marked and re-flagged the moment a new port opens on it — it doesn't silence the host permanently.";
+  // The NEW badge stays on a host until a person actually looks at it and
+  // dismisses it here — there's no timer anymore. Deliberately separate from
+  // "mark as checked" below: this is a one-time acknowledgement (no undo,
+  // and nothing brings the badge back later), while checked is a priority
+  // triage state that auto-clears the moment a new port opens.
+  const newInfoTip = "Clears the NEW badge for this host. This is one-time and can't be undone — it won't come back later the way \"marked as checked\" can.";
+  const newRow = qs("#hmNewRow");
+  newRow.innerHTML = "";
+  newRow.hidden = !h.isNew;
+  if (h.isNew) {
+    newRow.appendChild(el("span", { class: "badge-new", text: "NEW" }));
+    newRow.appendChild(el("span", { class: "hm-ack-status", text: "Not yet reviewed." }));
+    newRow.appendChild(el("button", {
+      class: "btn btn-small", onclick: async () => {
+        await Api.ackHostNew(h.id);
+        await refreshHosts();
+        openHostModal(h.id);
+        toast("Host reviewed — no longer flagged as new.");
+      },
+    }, ["Reviewed"]));
+    newRow.appendChild(el("span", { class: "hm-ack-info", tabindex: "0", "aria-label": "What does dismissing NEW do?", "data-tooltip": newInfoTip }, ["ⓘ"]));
+  }
+
+  const ackInfoTip = "Marking as checked means you're happy the current list of open ports is fine, so it drops out of priority views (the ⚑ filter, the dashboard's priority count) until something changes. It's automatically un-marked and re-flagged the moment a new port opens on it — it doesn't silence the host permanently.";
   const ackInfoIcon = el("span", { class: "hm-ack-info", tabindex: "0", "aria-label": "What does marking as checked do?", "data-tooltip": ackInfoTip }, ["ⓘ"]);
 
   const ackRow = qs("#hmAckRow");
@@ -1123,7 +1198,6 @@ function openHostModal(hostId) {
     if (h.acknowledged) {
       ackRow.appendChild(el("div", { class: "hm-ack-status" }, [
         "Marked as checked — won't be flagged as priority unless a new port opens.",
-        ackInfoIcon,
         el("button", {
           class: "btn btn-small", onclick: async () => {
             await Api.unackHost(h.id);
@@ -1132,9 +1206,9 @@ function openHostModal(hostId) {
             toast("Host unmarked.");
           },
         }, ["Unmark"]),
+        ackInfoIcon,
       ]));
     } else {
-      ackRow.appendChild(ackInfoIcon);
       ackRow.appendChild(el("button", {
         class: "btn btn-small", onclick: async () => {
           await Api.ackHost(h.id);
@@ -1143,15 +1217,18 @@ function openHostModal(hostId) {
           toast("Host marked as checked. It'll be re-flagged if a new port opens.");
         },
       }, ["Mark as checked"]));
+      ackRow.appendChild(ackInfoIcon);
     }
   }
 
+  const unconfirmedTitle = "Found via reverse DNS only — no ping/TCP/ARP response yet, and no open port has confirmed it up";
   qs("#hmStatus").innerHTML = "";
-  qs("#hmStatus").appendChild(el("span", { class: "pill " + (h.status === "down" ? "pill-bad" : "pill-good") }, [
+  qs("#hmStatus").appendChild(el("span", { class: "pill " + statusPillClass(h.status), title: h.status === "unknown" ? unconfirmedTitle : "" }, [
     el("span", { class: "dot" }), h.status,
   ]));
-  qs("#hmHostname").textContent = h.hostname || "—";
-  qs("#hmMac").textContent = h.mac || "—";
+  qs("#hmSubnet").textContent = subnetDisplayLabel(subnetById(h.subnetId));
+  qs("#hmHostnameInput").value = h.hostname || "";
+  qs("#hmMacInput").value = h.mac || "";
   qs("#hmSource").textContent = h.source;
   qs("#hmFirstSeen").textContent = timeAgo(h.firstSeen);
   qs("#hmLastSeen").textContent = timeAgo(h.lastSeen);
@@ -1188,6 +1265,8 @@ function openHostModal(hostId) {
   }
 
   qs("#hmNotes").oninput = markUnsaved;
+  qs("#hmHostnameInput").oninput = markUnsaved;
+  qs("#hmMacInput").oninput = markUnsaved;
 
   const deepScanBtn = qs("#hmDeepScan");
   deepScanBtn.disabled = false;
@@ -1206,7 +1285,19 @@ function openHostModal(hostId) {
   };
 
   qs("#hmSave").onclick = async () => {
-    await Api.updateHostNotes(h.id, qs("#hmNotes").value);
+    // hostname/mac are only sent when actually edited, not on every save —
+    // avoids an unnecessary PATCH when they're untouched.
+    const fields = { notes: qs("#hmNotes").value };
+    const hostnameVal = qs("#hmHostnameInput").value.trim();
+    if (hostnameVal !== (h.hostname || "")) fields.hostname = hostnameVal;
+    const macVal = qs("#hmMacInput").value.trim();
+    if (macVal !== (h.mac || "")) fields.mac = macVal;
+    try {
+      await Api.updateHost(h.id, fields);
+    } catch (err) {
+      toast(err.message, "bad");
+      return;
+    }
     for (const tagId of state.pendingTagRemoves) await Api.removeHostTag(h.id, tagId);
     for (const tagId of state.pendingTagAdds) await Api.addHostTag(h.id, tagId);
     state.pendingTagAdds = [];
@@ -1333,29 +1424,53 @@ async function refreshTags() {
   state.tags = await Api.tags();
 }
 
-const refreshDebounced = debounce(async () => {
+async function refreshHostsAndSubnets() {
   const [hosts, subnets] = await Promise.all([Api.hosts(), Api.subnets()]);
   state.hosts = hosts;
   state.subnets = subnets;
   renderAll();
-}, 350);
+}
+
+// Re-pulls risk rules and scan settings and re-renders their Settings-tab
+// UI — used after a system import, the only import that can also change
+// these (see wireImport), since renderRiskRules/renderScanMethodSettings
+// only run against whatever was already in memory otherwise.
+async function refreshRiskRulesAndSettings() {
+  const [riskRules, settings] = await Promise.all([Api.riskRules(), Api.settings()]);
+  state.riskRules = riskRules;
+  renderRiskRules();
+  renderScanMethodSettings(settings);
+}
+
+const refreshDebounced = debounce(refreshHostsAndSubnets, 350);
 
 /* ---------------------------------------------------------------------- */
 /* SSE                                                                    */
 /* ---------------------------------------------------------------------- */
 
+// sse/scanPollTimer are module-level (rather than local to connectSSE/
+// startLiveUpdates) so stopLiveUpdates() can tear them down from anywhere —
+// notably showLoginScreen(), so a session going stale (expiry, logout, or
+// the in-memory session store losing everything on a server restart)
+// actually stops hitting the server instead of the EventSource's built-in
+// reconnect and the 4s scan-status poll both hammering it with 401s forever
+// in the background with no visible sign to the user.
+let sse = null;
+let scanPollTimer = null;
+let sessionsPollTimer = null;
+
 function connectSSE() {
   const connLabel = qs("#connLabel"), connState = qs("#connState");
-  const es = new EventSource("/api/events/stream");
+  sse = new EventSource("/api/events/stream");
 
-  es.addEventListener("ready", () => {
+  sse.addEventListener("ready", () => {
     connLabel.textContent = "live";
     connState.className = "pill pill-good";
   });
 
   const evTypes = ["new_subnet", "new_host", "new_port", "host_down", "port_closed", "scan_anomaly", "hosts_cleared", "priority_reflag", "deep_scan_started", "deep_scan_finished"];
   for (const type of evTypes) {
-    es.addEventListener(type, (e) => {
+    sse.addEventListener(type, (e) => {
       const ev = JSON.parse(e.data);
       receiveNotification(ev);
       renderCounts();
@@ -1372,10 +1487,51 @@ function connectSSE() {
     });
   }
 
-  es.onerror = () => {
+  sse.onerror = () => {
     connLabel.textContent = "reconnecting…";
     connState.className = "pill pill-bad";
   };
+}
+
+/** Starts the SSE connection and the 4s scan-status poll if they aren't
+ * already running — called once on first login and again on every re-login
+ * after stopLiveUpdates() tore them down. Idempotent so it's safe to call
+ * from both startApp() paths without risking a duplicate interval/
+ * connection. */
+function startLiveUpdates() {
+  if (scanPollTimer) return;
+  connectSSE();
+  pollScanStatus();
+  scanPollTimer = setInterval(pollScanStatus, 4000);
+  pollActiveSessions();
+  sessionsPollTimer = setInterval(pollActiveSessions, 15000); // changes rarely, no need for the 4s cadence
+}
+
+/** Tears down the SSE connection and scan-status/active-sessions polls —
+ * see the comment on sse/scanPollTimer above for why. Safe to call even if
+ * nothing is running (e.g. the very first, pre-login showLoginScreen()
+ * call). */
+function stopLiveUpdates() {
+  if (scanPollTimer) {
+    clearInterval(scanPollTimer);
+    scanPollTimer = null;
+  }
+  if (sessionsPollTimer) {
+    clearInterval(sessionsPollTimer);
+    sessionsPollTimer = null;
+  }
+  if (sse) {
+    sse.close();
+    sse = null;
+  }
+}
+
+async function pollActiveSessions() {
+  try {
+    const { count } = await Api.activeSessions();
+    qs("#activeUsersCount").textContent = count;
+    qs("#activeUsers").title = count === 1 ? "1 user currently signed in" : `${count} users currently signed in`;
+  } catch (_) { /* transient */ }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1391,6 +1547,16 @@ async function pollScanStatus() {
   } catch (_) { /* transient */ }
 }
 
+// Mirrors discovery.ScanMode's values ("" = the regular automatic/system-
+// triggered cycle, otherwise one of the manually forced techniques).
+const SCAN_MODE_LABEL = {
+  "": "scanning…",
+  quick: "quick scanning…",
+  mass: "mass scanning…",
+  deep: "deep scanning…",
+  dns: "reverse DNS scanning…",
+};
+
 /** Renders from the cached lastScanStatus — called every second so "next
  * scan in Ns" counts down smoothly without a network round-trip each time. */
 function renderScanStatus() {
@@ -1398,7 +1564,9 @@ function renderScanStatus() {
   if (!st) return;
   const label = qs("#scanLabel"), pill = qs("#scanState");
   if (st.running) {
-    label.textContent = st.deep ? "deep scanning…" : "scanning…";
+    // st.mode is "" for the regular automatic/system-triggered cycle, or
+    // "quick"/"mass"/"deep"/"dns" for a manually forced one — see ScanMode.
+    label.textContent = SCAN_MODE_LABEL[st.mode] || "scanning…";
     pill.className = "pill pill-active";
   } else {
     label.textContent = "idle";
@@ -1444,6 +1612,25 @@ function updateFilterActiveCount() {
   badge.hidden = active === 0;
 }
 
+/** All the topbar/dropdown panels (filters, notifications, scan/export/
+ * import menus, account menu) toggle independently via their own
+ * document-click listener, but that listener never fires for a click on a
+ * *different* toggle button — those calls stopPropagation() so their own
+ * panel can open without immediately re-closing itself. Left alone, that
+ * meant opening one panel never closed whichever other one was already
+ * open. Every toggle calls closeDropdownPanels(exceptPanel) first so at
+ * most one is ever visible at a time. */
+const dropdownPanels = [];
+function registerDropdownPanel(panel) {
+  dropdownPanels.push(panel);
+  return panel;
+}
+function closeDropdownPanels(except) {
+  for (const p of dropdownPanels) {
+    if (p !== except) p.hidden = true;
+  }
+}
+
 function wireFilters() {
   const onChange = (key, transform) => (e) => {
     state.filters[key] = transform ? transform(e.target.value) : e.target.value;
@@ -1471,10 +1658,12 @@ function wireFilters() {
     renderGraph();
   });
 
-  const filterPanel = qs("#filterPanel");
+  const filterPanel = registerDropdownPanel(qs("#filterPanel"));
   qs("#btnFilters").addEventListener("click", (e) => {
     e.stopPropagation();
-    filterPanel.hidden = !filterPanel.hidden;
+    const opening = filterPanel.hidden;
+    closeDropdownPanels(filterPanel);
+    filterPanel.hidden = !opening;
   });
   filterPanel.addEventListener("click", (e) => e.stopPropagation());
   document.addEventListener("click", () => { filterPanel.hidden = true; });
@@ -1519,10 +1708,12 @@ function wireMiniDash() {
 }
 
 function wireNotifications() {
-  const panel = qs("#notifPanel");
+  const panel = registerDropdownPanel(qs("#notifPanel"));
   qs("#btnNotifs").addEventListener("click", (e) => {
     e.stopPropagation();
-    panel.hidden = !panel.hidden;
+    const opening = panel.hidden;
+    closeDropdownPanels(panel);
+    panel.hidden = !opening;
     if (!panel.hidden) markAllNotificationsRead();
   });
   panel.addEventListener("click", (e) => e.stopPropagation());
@@ -1542,68 +1733,865 @@ function wireGraphControls() {
   });
 }
 
-/** Applies state.viewMode to the layout and to which of the two Graph
- * instances is actively rendering. Pausing the hidden one (rather than
- * just hiding it with CSS) is the point of simple view: whichever graph
- * isn't shown stops doing any per-frame or on-demand canvas work outright,
- * instead of continuing to repaint an element the user can't see. */
-function applyViewMode() {
-  const simple = state.viewMode === "simple";
-  qs("#layout").classList.toggle("simple-view", simple);
-  const btn = qs("#btnViewToggle");
-  btn.textContent = simple ? "Graph view" : "Simple view";
-  btn.setAttribute("aria-pressed", String(simple));
+const VIEW_LABELS = { graph: "Graph", table: "Table" };
 
-  const shown = simple ? simpleGraph : graph;
-  const hidden = simple ? graph : simpleGraph;
-  if (hidden) hidden.setPaused(true);
-  if (shown) {
-    // Its canvas was display:none while hidden, so its rect (and anything
-    // sized from it) may be stale or zero; recompute before unpausing so
-    // switching to it doesn't briefly draw into a zero-sized canvas.
-    shown._resize();
-    shown.setPaused(false);
+/** Applies state.viewMode to the layout and to whether the graph is
+ * actively rendering. Pausing it (rather than just hiding it with CSS) is
+ * the point in table view: the canvas stops doing any per-frame work
+ * outright, instead of continuing to repaint an element the user can't
+ * see. */
+function applyViewMode() {
+  const mode = state.viewMode;
+  const layout = qs("#layout");
+  layout.classList.toggle("table-view", mode === "table");
+
+  qs("#btnViewMenuToggle").textContent = `View: ${VIEW_LABELS[mode]} ▾`;
+  for (const btn of qsa("#viewMenu .account-menu-item")) {
+    btn.classList.toggle("active", btn.dataset.view === mode);
   }
+
+  if (graph) {
+    if (mode === "table") {
+      graph.setPaused(true);
+    } else {
+      // Its canvas was display:none while hidden, so its rect (and
+      // anything sized from it) may be stale or zero; recompute before
+      // unpausing so switching to it doesn't briefly draw into a
+      // zero-sized canvas.
+      graph._resize();
+      graph.setPaused(false);
+    }
+  }
+  if (mode === "table") renderTableView();
 }
 
 function wireViewToggle() {
-  qs("#btnViewToggle").addEventListener("click", () => {
-    state.viewMode = state.viewMode === "simple" ? "graph" : "simple";
-    localStorage.setItem("viewMode", state.viewMode);
-    applyViewMode();
+  const menu = registerDropdownPanel(qs("#viewMenu"));
+  qs("#btnViewMenuToggle").addEventListener("click", (e) => {
+    e.stopPropagation();
+    const opening = menu.hidden;
+    closeDropdownPanels(menu);
+    menu.hidden = !opening;
+  });
+  menu.addEventListener("click", (e) => e.stopPropagation());
+  document.addEventListener("click", () => { menu.hidden = true; });
+
+  for (const btn of qsa("#viewMenu .account-menu-item")) {
+    btn.addEventListener("click", () => {
+      state.viewMode = btn.dataset.view;
+      localStorage.setItem("viewMode", state.viewMode);
+      menu.hidden = true;
+      applyViewMode();
+    });
+  }
+}
+
+/** The graph, when it's the visible view — what the +/- zoom buttons and
+ * any other view-agnostic graph control should act on. null in table
+ * view, where the canvas isn't shown. */
+function activeGraph() {
+  return state.viewMode === "table" ? null : graph;
+}
+
+/** +/- zoom buttons: an explicit, clickable alternative to scroll-to-zoom
+ * for anyone who'd rather not scroll or pinch-zoom to read the graph. */
+function wireZoomControls() {
+  const ZOOM_STEP = 1.4;
+  qs("#btnZoomIn").addEventListener("click", () => activeGraph()?.zoomBy(ZOOM_STEP));
+  qs("#btnZoomOut").addEventListener("click", () => activeGraph()?.zoomBy(1 / ZOOM_STEP));
+  qs("#btnZoomReset").addEventListener("click", () => activeGraph()?.resetZoom());
+}
+
+/** Reads file as JSON, calls apiFn with the parsed result, refreshes the
+ * host/subnet lists, and toasts summarizeFn's description of what happened
+ * — the common shape both import flows share, they only differ in which
+ * endpoint they call and how they describe the result. */
+async function runImport(file, apiFn, summarizeFn) {
+  let doc;
+  try {
+    doc = JSON.parse(await file.text());
+  } catch (err) {
+    toast("That file isn't valid JSON.", "bad");
+    return;
+  }
+  try {
+    const result = await apiFn(doc);
+    await refreshHostsAndSubnets();
+    toast(summarizeFn(result));
+  } catch (err) {
+    toast(`Import failed: ${err.message}`, "bad");
+  }
+}
+
+// Like runImport, but for formats that aren't JSON (nmap/masscan XML) — reads
+// the file as raw text instead of parsing it client-side and hands it
+// straight to apiFn.
+async function runImportText(file, apiFn, summarizeFn) {
+  try {
+    const result = await apiFn(await file.text());
+    await refreshHostsAndSubnets();
+    toast(summarizeFn(result));
+  } catch (err) {
+    toast(`Import failed: ${err.message}`, "bad");
+  }
+}
+
+/** Builds a segments/hosts/ports export document (same snake_case schema as
+ * the server's /api/export/network-map, see exportNetworkMap in
+ * internal/api/export.go) from a client-side host list, so "Export
+ * (filtered)" can restrict the download to what's currently on screen
+ * without a round trip to teach the backend the whole filter set. */
+function exportSegmentsFor(hosts) {
+  const subnetIds = new Set(hosts.map((h) => h.subnetId));
+  return state.subnets
+    .filter((sn) => subnetIds.has(sn.id))
+    .map((sn) => ({ id: `seg-${sn.id}`, name: sn.name || "", cidr: sn.cidr }));
+}
+
+/** Appends this host's risk findings (see riskBadge/riskForPorts) to its
+ * notes, mirroring hostExportNotes in internal/api/export.go, so the
+ * recommendations the app surfaces in-app survive into the exported file. */
+function exportNotesFor(h) {
+  if (!(h.riskReasons || []).length) return h.notes || "";
+  const findings = "Flagged: " + h.riskReasons.join("; ");
+  return h.notes ? `${h.notes}\n\n${findings}` : findings;
+}
+
+function exportHostFor(h) {
+  const eh = { id: `host-${h.id}`, segment_id: `seg-${h.subnetId}` };
+  if (h.hostname) eh.hostname = h.hostname;
+  eh.ip = h.ip;
+  if (h.mac) eh.mac = h.mac;
+  eh.management_ip = h.ip;
+  if (h.vendor) eh.vendor = h.vendor;
+  const notes = exportNotesFor(h);
+  if (notes) eh.notes = notes;
+  return eh;
+}
+
+function exportPortsFor(h) {
+  return (h.ports || []).map((p) => {
+    const ep = { host_id: `host-${h.id}`, protocol: p.protocol, port: p.port, state: p.state };
+    if (p.service) ep.service = p.service;
+    const version = p.version || p.product;
+    if (version) ep.version = version;
+    if (p.banner) ep.notes = p.banner;
+    return ep;
   });
 }
 
+function buildExportDoc(hosts) {
+  return {
+    segments: exportSegmentsFor(hosts),
+    hosts: hosts.map(exportHostFor),
+    ports: hosts.flatMap(exportPortsFor),
+  };
+}
+
+function exportTimestamp() {
+  return new Date().toISOString().replace(/[:.]/g, "").replace("T", "-").slice(0, 15);
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function downloadJSON(doc, filenamePrefix) {
+  downloadBlob(new Blob([JSON.stringify(doc)], { type: "application/json" }), `${filenamePrefix}-${exportTimestamp()}.json`);
+}
+
+/** Hosts flagged as priority — riskLevel set and not yet acknowledged — the
+ * same definition the dashboard's "priority" tile and ⚑ filter use (see
+ * renderCounts/priorityOnly), sorted worst-first for the report. Uses
+ * visibleHosts() rather than filteredHosts() so the report always covers
+ * every priority host regardless of whatever search/status/tag filter
+ * happens to be active, the same way the dashboard counts do. */
+function priorityReportHosts() {
+  return visibleHosts()
+    .filter((h) => h.riskLevel && !h.acknowledged)
+    .slice()
+    .sort((a, b) => {
+      const ra = RISK_SORT_RANK[a.riskLevel] || 0;
+      const rb = RISK_SORT_RANK[b.riskLevel] || 0;
+      if (ra !== rb) return rb - ra;
+      return a.ip.localeCompare(b.ip, undefined, { numeric: true });
+    });
+}
+
+function csvCell(value) {
+  const s = String(value ?? "");
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+function buildPriorityReportCsv(hosts) {
+  const header = ["IP", "Hostname", "Subnet", "Risk Level", "Findings", "MAC", "Vendor"];
+  const rows = hosts.map((h) => [
+    h.ip,
+    h.hostname || "",
+    subnetById(h.subnetId)?.cidr || "",
+    h.riskLevel,
+    (h.riskReasons || []).join("; "),
+    h.mac || "",
+    h.vendor || "",
+  ]);
+  return [header, ...rows].map((row) => row.map(csvCell).join(",")).join("\r\n");
+}
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+
+function priorityReportHtmlRow(h) {
+  const findings = (h.riskReasons || []).map((r) => `<li>${escapeHtml(r)}</li>`).join("");
+  return `<tr>
+    <td>${escapeHtml(h.ip)}</td>
+    <td>${escapeHtml(h.hostname || "—")}</td>
+    <td>${escapeHtml(subnetById(h.subnetId)?.cidr || "—")}</td>
+    <td><span class="badge badge-${h.riskLevel}">${escapeHtml(h.riskLevel.toUpperCase())}</span></td>
+    <td><ul>${findings}</ul></td>
+  </tr>`;
+}
+
+function buildPriorityReportHtml(hosts) {
+  const counts = { critical: 0, warning: 0, info: 0 };
+  for (const h of hosts) counts[h.riskLevel] = (counts[h.riskLevel] || 0) + 1;
+  const rows = hosts.map(priorityReportHtmlRow).join("") ||
+    `<tr><td colspan="5">No priority hosts — nothing to report.</td></tr>`;
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Priority Host Report</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 32px; background: #12141a; color: #e6e6e6; }
+  h1 { margin: 0 0 4px; font-size: 22px; }
+  .meta { color: #9aa0a6; font-size: 13px; margin-bottom: 24px; }
+  .summary { display: flex; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
+  .summary div { padding: 10px 16px; border-radius: 8px; background: #1c1f27; font-size: 13px; min-width: 90px; }
+  .summary strong { display: block; font-size: 20px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #2a2e37; vertical-align: top; }
+  th { color: #9aa0a6; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: .04em; }
+  ul { margin: 0; padding-left: 18px; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; white-space: nowrap; }
+  .badge-critical { background: #4a1414; color: #ff6b6b; }
+  .badge-warning { background: #4a3a10; color: #fab219; }
+  .badge-info { background: #16324a; color: #6cb6ff; }
+  @media print { body { background: #fff; color: #000; } .summary div { background: #f2f2f2; } }
+</style>
+</head>
+<body>
+  <h1>Priority Host Report</h1>
+  <div class="meta">Generated ${escapeHtml(new Date().toLocaleString())} — Network Enumerator</div>
+  <div class="summary">
+    <div><strong>${hosts.length}</strong>Priority hosts</div>
+    <div><strong>${counts.critical}</strong>Critical</div>
+    <div><strong>${counts.warning}</strong>Warning</div>
+    <div><strong>${counts.info}</strong>Info</div>
+  </div>
+  <table>
+    <thead><tr><th>IP</th><th>Hostname</th><th>Subnet</th><th>Risk</th><th>Findings</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+</body>
+</html>`;
+}
+
+function downloadPriorityReport(format) {
+  const hosts = priorityReportHosts();
+  const stamp = exportTimestamp();
+  if (format === "csv") {
+    downloadBlob(new Blob([buildPriorityReportCsv(hosts)], { type: "text/csv" }), `priority-report-${stamp}.csv`);
+  } else {
+    downloadBlob(new Blob([buildPriorityReportHtml(hosts)], { type: "text/html" }), `priority-report-${stamp}.html`);
+  }
+}
+
+/** Mermaid label text can't contain a literal double quote or newline —
+ * #quot; is Mermaid's own HTML-entity escape for a literal quote inside a
+ * quoted label, and a run of newlines is flattened to a single space since
+ * multi-line labels use <br/> instead (see mermaidHostLabel). */
+function mermaidEscape(s) {
+  return String(s ?? "").replace(/"/g, "#quot;").replace(/[\r\n]+/g, " ").trim();
+}
+
+function mermaidStatusClass(status) {
+  if (status === "down") return "statusDown";
+  if (status === "unknown") return "statusUnknown";
+  return "statusUp";
+}
+
+/** Fill/stroke/font trio per status class, shared by both diagram exports —
+ * buildMermaidDiagram's classDef lines and buildDrawioDiagram's native node
+ * styles — so a host's status maps to the same color everywhere. "down" is
+ * yellow rather than red: red reads as "this needs urgent action" for a
+ * pentest audience, when a non-responding host is routine and expected.
+ * Yellow's fill is light enough that it needs a dark font color, unlike
+ * the other two statuses' white text on a dark fill. */
+const STATUS_FILL = {
+  statusUp: { fill: "#0ca30c", stroke: "#087a08", font: "#ffffff" },
+  statusDown: { fill: "#e6b800", stroke: "#a37f00", font: "#3d2e00" },
+  statusUnknown: { fill: "#898781", stroke: "#5f5d59", font: "#ffffff" },
+};
+
+/** Number of columns for a roughly-square grid of n items — ceil(sqrt(n)),
+ * so hosts within a subnet square off (4→2x2, 5→3+2, 6→3x3) instead of
+ * forming one long row or column. Shared by buildMermaidDiagram (nested
+ * row subgraphs) and buildDrawioDiagram (a literal x/y grid). */
+function gridColumns(n) {
+  return Math.max(1, Math.ceil(Math.sqrt(n)));
+}
+
+/** Splits items into row-major chunks of `cols` — the last row gets
+ * whatever's left over (e.g. 5 items at 3 cols → rows of [3, 2]). */
+function gridRows(items, cols) {
+  const rows = [];
+  for (let i = 0; i < items.length; i += cols) rows.push(items.slice(i, i + cols));
+  return rows;
+}
+
+/** One host node's label: IP, then hostname (via <br/>) when present,
+ * prefixed with a warning marker for an unacknowledged priority host — the
+ * same "priority" definition priorityReportHosts uses. Ports are
+ * deliberately not shown here — they live only in the ports table
+ * (mermaidPortsTableLines) so the diagram stays readable and each host's
+ * ports appear in exactly one place. */
+function mermaidHostLabel(h) {
+  const lines = [h.ip];
+  if (h.hostname) lines.push(h.hostname);
+  const prefix = h.riskLevel && !h.acknowledged ? "⚠ " : "";
+  return prefix + lines.map(mermaidEscape).join("<br/>");
+}
+
+function statusLabel(status) {
+  if (status === "down") return "Down";
+  if (status === "unknown") return "Unconfirmed";
+  return "Up";
+}
+
+/** Legend block for buildMermaidDiagram — plain classDef'd nodes, same trick
+ * the diagram itself uses to communicate status by color, just labeled in
+ * English so the file explains its own color key without external docs. */
+function mermaidLegendLines() {
+  return [
+    '  subgraph LEGEND["Legend"]',
+    '    legUp["Up — confirmed live"]:::statusUp',
+    '    legDown["Down — not responding"]:::statusDown',
+    '    legUnk["Unconfirmed — PTR only, no open port"]:::statusUnknown',
+    "  end",
+  ];
+}
+
+/** Escapes a value for use inside an HTML <td>/<th> in a Mermaid node label
+ * — different rules from mermaidEscape's plain-text labels, since this text
+ * lands inside real HTML tags rather than Mermaid label text: & < > " all
+ * need entity-escaping, and the trailing &quot; also keeps the value from
+ * breaking out of the label's own surrounding quotes. */
+function mermaidTableCell(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/[\r\n]+/g, " ")
+    .trim() || "—";
+}
+
+/** Builds the "Hosts & Open Ports" HTML table shared by both diagram
+ * exports (mermaidPortsTableLines below, and buildDrawioDiagram's native
+ * table node) — one row per host across every subnet, sorted the same way
+ * each diagram's host nodes are. */
+function buildHostPortsTableHtml(subnets, hosts) {
+  const bySubnet = new Map();
+  for (const h of hosts) {
+    if (!bySubnet.has(h.subnetId)) bySubnet.set(h.subnetId, []);
+    bySubnet.get(h.subnetId).push(h);
+  }
+
+  const rows = ["<tr><th>Subnet</th><th>IP</th><th>Hostname</th><th>Status</th><th>Open Ports</th></tr>"];
+  for (const sn of subnets) {
+    const snHosts = (bySubnet.get(sn.id) || []).slice().sort((a, b) => a.ip.localeCompare(b.ip, undefined, { numeric: true }));
+    for (const h of snHosts) {
+      const openPorts = (h.ports || [])
+        .filter((p) => p.state === "open")
+        .map((p) => p.port)
+        .sort((a, b) => a - b)
+        .join(", ");
+      rows.push(
+        "<tr>" +
+          `<td>${mermaidTableCell(subnetDisplayLabel(sn))}</td>` +
+          `<td>${mermaidTableCell(h.ip)}</td>` +
+          `<td>${mermaidTableCell(h.hostname)}</td>` +
+          `<td>${statusLabel(h.status)}</td>` +
+          `<td>${mermaidTableCell(openPorts)}</td>` +
+          "</tr>",
+      );
+    }
+  }
+
+  return `<table>${rows.join("")}</table>`;
+}
+
+/** Mermaid has no dedicated "table" diagram type, but its flowchart renderer
+ * accepts raw HTML inside a quoted node label (htmlLabels is on by
+ * default) — so a single node whose label is one big <table> renders as an
+ * actual table. */
+function mermaidPortsTableLines(subnets, hosts) {
+  return [
+    '  subgraph PORTS["Hosts & Open Ports"]',
+    `    portsTable["${buildHostPortsTableHtml(subnets, hosts)}"]`,
+    "  end",
+  ];
+}
+
+/** Builds the single Mermaid export: a status legend, subnets as subgraphs
+ * with hosts as color-coded nodes (IP/hostname only, no ports), and a table
+ * node listing every host's open ports — one self-contained .mmd file, pure
+ * Mermaid syntax, no Markdown wrapper. The host/port table relies on raw
+ * HTML inside a node label (htmlLabels), which is a newer-Mermaid feature
+ * some tools' Mermaid parsers (e.g. draw.io's) may not render — this
+ * trades that compatibility for having ports in one place instead of
+ * duplicated onto every node label. */
+function buildMermaidDiagram(subnets, hosts) {
+  const bySubnet = new Map();
+  for (const h of hosts) {
+    if (!bySubnet.has(h.subnetId)) bySubnet.set(h.subnetId, []);
+    bySubnet.get(h.subnetId).push(h);
+  }
+
+  const lines = [
+    "flowchart LR",
+    ...Object.entries(STATUS_FILL).map(([cls, c]) => `classDef ${cls} fill:${c.fill},stroke:${c.stroke},color:${c.font};`),
+    "classDef gridRow fill:none,stroke:none;",
+    ...mermaidLegendLines(),
+  ];
+
+  for (const sn of subnets) {
+    const snHosts = (bySubnet.get(sn.id) || []).slice().sort((a, b) => a.ip.localeCompare(b.ip, undefined, { numeric: true }));
+    lines.push(`  subgraph seg${sn.id}["${mermaidEscape(subnetDisplayLabel(sn))}"]`);
+    lines.push("    direction TB");
+    if (snHosts.length === 0) {
+      lines.push(`    seg${sn.id}empty["no hosts"]`);
+    } else {
+      // Each row is its own nested subgraph so hosts square off into a
+      // grid instead of one long column: gridRows splits snHosts into
+      // roughly-sqrt(n)-wide rows, each row gets "direction LR" so its
+      // hosts sit side by side, and an invisible link (~~~) between the
+      // hosts in a row is what actually forces that — same reason (and
+      // same fix) the subnet-to-subnet chain below exists. The row
+      // subgraphs themselves are disconnected from each other, so they
+      // also need chaining to stack top to bottom under "direction TB".
+      const rows = gridRows(snHosts, gridColumns(snHosts.length));
+      rows.forEach((row, ri) => {
+        lines.push(`    subgraph seg${sn.id}row${ri}[" "]:::gridRow`);
+        lines.push("      direction LR");
+        for (const h of row) {
+          lines.push(`      host${h.id}["${mermaidHostLabel(h)}"]:::${mermaidStatusClass(h.status)}`);
+        }
+        if (row.length > 1) lines.push(`      ${row.map((h) => `host${h.id}`).join(" ~~~ ")}`);
+        lines.push("    end");
+      });
+      if (rows.length > 1) {
+        lines.push(`    ${rows.map((_, ri) => `seg${sn.id}row${ri}`).join(" ~~~ ")}`);
+      }
+    }
+    lines.push("  end");
+  }
+
+  // Subgraphs aren't connected to each other by anything, so the layout
+  // engine treats each subnet as its own disconnected component and stacks
+  // them top-to-bottom regardless of the top-level "LR" direction — the
+  // same reason host nodes need chaining above. An invisible link between
+  // consecutive subgraphs is what actually forces subnets to line up
+  // side-by-side.
+  if (subnets.length > 1) {
+    lines.push(`  ${subnets.map((sn) => `seg${sn.id}`).join(" ~~~ ")}`);
+  }
+
+  lines.push(...mermaidPortsTableLines(subnets, hosts));
+
+  return lines.join("\n");
+}
+
+/** Downloads the Mermaid export for every non-hidden subnet/host — the same
+ * "what's actually in scope" default visibleHosts()/priorityReportHosts use
+ * elsewhere, so a hidden management subnet doesn't clutter a diagram meant
+ * for sharing outside the app. */
+function downloadMermaidDiagram() {
+  const subnets = state.subnets.filter((sn) => !sn.hidden);
+  const subnetIds = new Set(subnets.map((sn) => sn.id));
+  const hosts = state.hosts.filter((h) => subnetIds.has(h.subnetId));
+  downloadBlob(new Blob([buildMermaidDiagram(subnets, hosts)], { type: "text/plain" }), `network-map-${exportTimestamp()}.mmd`);
+}
+
+/** Escapes a value for an XML attribute in the draw.io export — & < > "
+ * need entity-escaping same as any XML attribute, and a literal newline
+ * needs the numeric reference &#10; since XML attribute-value
+ * normalization would otherwise flatten it to a space. */
+function drawioAttr(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+    .replace(/\n/g, "&#10;");
+}
+
+/** One host node's label for the draw.io export — same content as
+ * mermaidHostLabel (IP, then hostname, prefixed with a warning marker for
+ * an unacknowledged priority host) but plain-text lines instead of <br/>,
+ * since draw.io node values aren't HTML unless the node's style says so. */
+function drawioHostLabel(h) {
+  const lines = [h.ip];
+  if (h.hostname) lines.push(h.hostname);
+  const prefix = h.riskLevel && !h.acknowledged ? "⚠ " : "";
+  return prefix + lines.join("\n");
+}
+
+/** draw.io's built-in "Network" stencil set (stencils/networks.xml, ships
+ * with no import/library step needed) has no generic "Server" or
+ * "Workstation" pictogram — only specific ones. "Mail Server" and "PC" are
+ * the closest visual stand-ins (a generic server-chassis glyph and a
+ * generic desktop-computer glyph respectively); "Router" is a direct hit. */
+const HOST_KIND_SHAPE = {
+  router: "mxgraph.networks.router",
+  server: "mxgraph.networks.mail_server",
+  workstation: "mxgraph.networks.pc",
+};
+
+/** The app has no explicit "role" field for a host, so the draw.io export
+ * guesses one from cheap signals: a .1 (or named rtr/router/gw/gateway/fw)
+ * address is almost always a gateway; a host with a classic server-side
+ * port open (web/mail/dns/db/directory, as opposed to the Windows
+ * admin/RPC ports every workstation in this app's scans tends to expose)
+ * is a server; anything else defaults to a workstation. It's a heuristic,
+ * not ground truth — good enough for an icon, not for a security finding. */
+function inferHostKind(h) {
+  const lastOctet = Number(h.ip.split(".").pop());
+  const name = (h.hostname || "").toLowerCase();
+  if (lastOctet === 1 || /(^|[-_.])(rtr|router|gw|gateway|fw|firewall)([-_.]|$)/.test(name)) return "router";
+  const SERVER_PORTS = new Set([21, 25, 53, 80, 110, 143, 389, 443, 636, 993, 995, 1433, 1521, 3306, 5432, 8080, 8443]);
+  const hasServerPort = (h.ports || []).some((p) => p.state === "open" && SERVER_PORTS.has(p.port));
+  return hasServerPort ? "server" : "workstation";
+}
+
+/** Builds a single native draw.io (.drawio) file: a status legend and an
+ * icon-key legend, subnets as labeled boxes with hosts arranged in a
+ * roughly-square grid inside (see gridColumns/gridRows — same layout
+ * buildMermaidDiagram produces), each host drawn as a router/server/
+ * workstation icon (see inferHostKind) tinted by status, and a table node
+ * listing every host's open ports. Unlike the Mermaid export, draw.io
+ * opens this directly with no import step — so layout is computed here
+ * with a fixed grid rather than relying on draw.io's own Mermaid-import
+ * layout engine. */
+function buildDrawioDiagram(subnets, hosts) {
+  const bySubnet = new Map();
+  for (const h of hosts) {
+    if (!bySubnet.has(h.subnetId)) bySubnet.set(h.subnetId, []);
+    bySubnet.get(h.subnetId).push(h);
+  }
+
+  // 60x44 is a compromise box: close to "PC"/"Mail Server"'s native aspect
+  // (100x70, 103x107) without either dominating; "Router" (100x29) still
+  // renders a bit taller than its native aspect, but recognizable.
+  const ICON_W = 60, ICON_H = 44, LABEL_H = 30, CELL_W = 150, CELL_GAP_X = 20, CELL_GAP_Y = 15;
+  const CELL_H = ICON_H + LABEL_H;
+  const PAD = 20, TITLE_H = 30, SUBNET_GAP_X = 40;
+  const CONTAINER_STYLE = "rounded=0;whiteSpace=wrap;html=1;verticalAlign=top;fillColor=#f5f5f5;strokeColor=#666666;fontStyle=1;fontSize=14;";
+  const iconStyle = (shape, fill, stroke, font) =>
+    `shape=${shape};html=1;fillColor=${fill};strokeColor=${stroke};fontColor=${font};` +
+    "verticalLabelPosition=bottom;verticalAlign=top;align=center;fontSize=11;outlineConnect=0;";
+
+  let idCounter = 2;
+  const cells = [];
+  const addNode = (value, style, x, y, w, h) => {
+    const id = `n${idCounter++}`;
+    cells.push(
+      `        <mxCell id="${id}" value="${drawioAttr(value)}" style="${drawioAttr(style)}" vertex="1" parent="1">` +
+        `<mxGeometry x="${x}" y="${y}" width="${w}" height="${h}" as="geometry" /></mxCell>`,
+    );
+    return id;
+  };
+
+  // ---- Legends: status color, and icon-shape key ----
+  const LEGEND_W = 380, SWATCH_H = 40, SWATCH_GAP = 10;
+  const legendEntries = [
+    ["statusUp", "Up — confirmed live"],
+    ["statusDown", "Down — not responding"],
+    ["statusUnknown", "Unconfirmed — PTR only, no open port"],
+  ];
+  const legendH = TITLE_H + PAD + legendEntries.length * SWATCH_H + (legendEntries.length - 1) * SWATCH_GAP + PAD;
+  addNode("Legend", CONTAINER_STYLE, PAD, PAD, LEGEND_W, legendH);
+  legendEntries.forEach(([cls, label], i) => {
+    const c = STATUS_FILL[cls];
+    addNode(
+      label,
+      `whiteSpace=wrap;html=1;strokeWidth=1;fillColor=${c.fill};strokeColor=${c.stroke};fontColor=${c.font};fontSize=12;`,
+      PAD * 2, PAD + TITLE_H + PAD + i * (SWATCH_H + SWATCH_GAP), LEGEND_W - PAD * 2, SWATCH_H,
+    );
+  });
+
+  const kindLegendX = PAD + LEGEND_W + 40;
+  const kindLegendCellW = 110;
+  const kindEntries = [["router", "Router"], ["server", "Server"], ["workstation", "Workstation"]];
+  const kindLegendW = kindEntries.length * kindLegendCellW + PAD * 2;
+  const kindLegendH = TITLE_H + PAD + ICON_H + LABEL_H + PAD;
+  addNode("Icons", CONTAINER_STYLE, kindLegendX, PAD, kindLegendW, kindLegendH);
+  kindEntries.forEach(([kind, label], i) => {
+    addNode(
+      label,
+      iconStyle(HOST_KIND_SHAPE[kind], "#dae8fc", "#6c8ebf", "#333333"),
+      kindLegendX + PAD + i * kindLegendCellW + (kindLegendCellW - ICON_W) / 2, PAD + TITLE_H + PAD, ICON_W, ICON_H,
+    );
+  });
+
+  // ---- Subnets: left-to-right, hosts in a roughly-square grid within each ----
+  const subnetRowY = PAD + Math.max(legendH, kindLegendH) + 40;
+  let x = PAD;
+  let maxSubnetH = 0;
+  for (const sn of subnets) {
+    const snHosts = (bySubnet.get(sn.id) || []).slice().sort((a, b) => a.ip.localeCompare(b.ip, undefined, { numeric: true }));
+    const cols = gridColumns(snHosts.length || 1);
+    const rows = Math.max(Math.ceil(snHosts.length / cols), 1);
+    const subnetW = cols * CELL_W + (cols - 1) * CELL_GAP_X + PAD * 2;
+    const subnetH = TITLE_H + PAD + rows * CELL_H + (rows - 1) * CELL_GAP_Y + PAD;
+    maxSubnetH = Math.max(maxSubnetH, subnetH);
+    addNode(subnetDisplayLabel(sn), CONTAINER_STYLE, x, subnetRowY, subnetW, subnetH);
+    if (snHosts.length === 0) {
+      addNode(
+        "no hosts",
+        "whiteSpace=wrap;html=1;strokeWidth=1;fillColor=#ffffff;strokeColor=#999999;fontColor=#666666;fontSize=12;fontStyle=2;",
+        x + PAD, subnetRowY + TITLE_H + PAD, CELL_W, ICON_H,
+      );
+    } else {
+      snHosts.forEach((h, i) => {
+        const col = i % cols;
+        const row = Math.floor(i / cols);
+        const c = STATUS_FILL[mermaidStatusClass(h.status)];
+        const cellX = x + PAD + col * (CELL_W + CELL_GAP_X);
+        const cellY = subnetRowY + TITLE_H + PAD + row * (CELL_H + CELL_GAP_Y);
+        addNode(
+          drawioHostLabel(h),
+          iconStyle(HOST_KIND_SHAPE[inferHostKind(h)], c.fill, c.stroke, "#333333"),
+          cellX + (CELL_W - ICON_W) / 2, cellY, ICON_W, ICON_H,
+        );
+      });
+    }
+    x += subnetW + SUBNET_GAP_X;
+  }
+
+  // ---- Ports table ----
+  const tableY = subnetRowY + maxSubnetH + 40;
+  const tableW = Math.max(x - SUBNET_GAP_X - PAD, 700);
+  const tableH = 30 + (hosts.length + 1) * 26;
+  addNode(
+    buildHostPortsTableHtml(subnets, hosts),
+    "html=1;whiteSpace=wrap;strokeWidth=1;fillColor=#ECECFF;strokeColor=#9370DB;align=left;verticalAlign=top;fontSize=12;",
+    PAD, tableY, tableW, tableH,
+  );
+
+  const diagramId = `net-${Date.now().toString(36)}`;
+  return `<mxfile host="app.diagrams.net">
+  <diagram name="Network Map" id="${diagramId}">
+    <mxGraphModel dx="800" dy="600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+${cells.join("\n")}
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
+`;
+}
+
+/** Downloads the draw.io export for every non-hidden subnet/host — same
+ * scope as downloadMermaidDiagram. */
+function downloadDrawioDiagram() {
+  const subnets = state.subnets.filter((sn) => !sn.hidden);
+  const subnetIds = new Set(subnets.map((sn) => sn.id));
+  const hosts = state.hosts.filter((h) => subnetIds.has(h.subnetId));
+  downloadBlob(new Blob([buildDrawioDiagram(subnets, hosts)], { type: "application/xml" }), `network-map-${exportTimestamp()}.drawio`);
+}
+
+/** "Export ▾" mirrors the "Import ▾" menu right next to it:
+ *  - Host & subnet data export — Export (filtered) (JSON): only the hosts
+ *    matching the current search/status/tag/risk/etc. filters (see
+ *    filteredHosts) and hidden-subnet setting — built client-side since the
+ *    backend has no equivalent filter API.
+ *  - Host & subnet data export — Export (all, including hidden) (JSON): the
+ *    complete network map regardless of any UI filter, via the same
+ *    download the button used to be.
+ *  - Reports (HTML/CSV): a human-readable report of every priority-flagged
+ *    host and its findings, for handing to someone who isn't going to load
+ *    the network map JSON back into this app.
+ *  - Network diagrams: a single .mmd file with subnets/hosts as a
+ *    color-coded flowchart plus an embedded host/port table (see
+ *    buildMermaidDiagram), or the same content as a native .drawio file
+ *    needing no import step (see buildDrawioDiagram).
+ *  - System: a full backup (subnets — including hidden/disabled state —
+ *    hosts, ports, settings, and risky service triage rules) via
+ *    /api/export/system, for restoring this exact app state elsewhere
+ *    rather than interop with other tooling (see exportSystem in
+ *    internal/api/systemexport.go). */
+function wireExport() {
+  const exportMenu = registerDropdownPanel(qs("#exportMenu"));
+  qs("#btnExportMenuToggle").addEventListener("click", (e) => {
+    e.stopPropagation();
+    const opening = exportMenu.hidden;
+    closeDropdownPanels(exportMenu);
+    exportMenu.hidden = !opening;
+  });
+  exportMenu.addEventListener("click", (e) => e.stopPropagation());
+  document.addEventListener("click", () => { exportMenu.hidden = true; });
+
+  qs("#btnExportFiltered").addEventListener("click", () => {
+    exportMenu.hidden = true;
+    downloadJSON(buildExportDoc(filteredHosts()), "network-map-export-filtered");
+  });
+  qs("#btnExportAll").addEventListener("click", () => {
+    exportMenu.hidden = true;
+    window.location.href = "/api/export/network-map";
+  });
+  qs("#btnReportPriorityHtml").addEventListener("click", () => {
+    exportMenu.hidden = true;
+    downloadPriorityReport("html");
+  });
+  qs("#btnReportPriorityCsv").addEventListener("click", () => {
+    exportMenu.hidden = true;
+    downloadPriorityReport("csv");
+  });
+  qs("#btnExportMermaid").addEventListener("click", () => {
+    exportMenu.hidden = true;
+    downloadMermaidDiagram();
+  });
+  qs("#btnExportDrawio").addEventListener("click", () => {
+    exportMenu.hidden = true;
+    downloadDrawioDiagram();
+  });
+  qs("#btnExportSystem").addEventListener("click", () => {
+    exportMenu.hidden = true;
+    window.location.href = "/api/export/system";
+  });
+}
+
+/** Four import flows share one dropdown menu, split into "scan imports"
+ * (output from an external scan tool run outside this app) and "system
+ * imports" (a document previously exported by this app itself), mirroring
+ * the "Scan now ▾" menu right next to it:
+ *  - DNS recon scan (JSON) [scan import]: enriches hosts with hostnames from
+ *    a dnsrecon -j scan, creating subnets/hosts that don't exist yet.
+ *  - Nmap/masscan scan (XML) [scan import]: imports hosts and open ports
+ *    from an -oX scan (nmap or masscan — both use the same schema), creating
+ *    subnets/hosts that don't exist yet.
+ *  - Network map (JSON) [system import]: restores subnets/hosts/open-ports
+ *    from a network map previously downloaded via "Export JSON" — mainly for
+ *    a fresh run (in-memory, or a -db-file that doesn't exist yet) that
+ *    would otherwise start from a completely empty inventory.
+ *  - System import (all data) [system import]: restores everything a system
+ *    export produced — subnets (including hidden/disabled state), hosts,
+ *    ports, settings, and risky service triage rules — via
+ *    /api/import/system (see importSystem in internal/api/systemexport.go).
+ * All four are additive: re-importing, or importing on top of a database
+ * that already has scan data, only ever fills in gaps. */
+function wireImport() {
+  const importMenu = registerDropdownPanel(qs("#importMenu"));
+  qs("#btnImportMenuToggle").addEventListener("click", (e) => {
+    e.stopPropagation();
+    const opening = importMenu.hidden;
+    closeDropdownPanels(importMenu);
+    importMenu.hidden = !opening;
+  });
+  importMenu.addEventListener("click", (e) => e.stopPropagation());
+  document.addEventListener("click", () => { importMenu.hidden = true; });
+
+  // extraRefresh covers state runFn's own refreshHostsAndSubnets doesn't
+  // touch — only the system import needs it, since it's the only import
+  // that can also change risk rules and settings, and the UI otherwise
+  // wouldn't pick those up until a full page reload.
+  const wireImportItem = (buttonId, fileInputId, apiFn, summarizeFn, runFn = runImport, extraRefresh = null) => {
+    const fileInput = qs(fileInputId);
+    qs(buttonId).addEventListener("click", () => {
+      importMenu.hidden = true;
+      fileInput.click();
+    });
+    fileInput.addEventListener("change", async () => {
+      const file = fileInput.files[0];
+      fileInput.value = ""; // so picking the same file again still fires "change"
+      if (!file) return;
+      await runFn(file, apiFn, summarizeFn);
+      if (extraRefresh) await extraRefresh();
+    });
+  };
+
+  wireImportItem("#btnImportNetworkMap", "#importNetworkMapFileInput", Api.importNetworkMap,
+    (r) => `Imported ${r.segments} segment(s), ${r.hosts} host(s) (${r.newHosts} new), ${r.newPorts} new open port(s).`);
+  wireImportItem("#btnImportSystem", "#importSystemFileInput", Api.importSystem,
+    (r) => `Imported system export: ${r.segments} segment(s), ${r.hosts} host(s) (${r.newHosts} new), ${r.newPorts} new open port(s), ${r.riskRules} risk rule(s) (${r.newRiskRules} new), settings restored.`,
+    runImport, refreshRiskRulesAndSettings);
+  wireImportItem("#btnImportDnsRecon", "#importDnsReconFileInput", Api.importDnsRecon,
+    (r) => `Imported dnsrecon scan: ${r.addresses} address(es), ${r.newSubnets} new subnet(s), ${r.newHosts} new host(s).`);
+  wireImportItem("#btnImportNmap", "#importNmapFileInput", Api.importNmapXml,
+    (r) => `Imported nmap scan: ${r.hosts} host(s) (${r.newSubnets} new subnet(s), ${r.newHosts} new), ${r.newPorts} new open port(s).`,
+    runImportText);
+}
+
 function wireTopbar() {
-  const scanMenu = qs("#scanMenu");
+  const scanMenu = registerDropdownPanel(qs("#scanMenu"));
   qs("#btnScanMenuToggle").addEventListener("click", (e) => {
     e.stopPropagation();
-    scanMenu.hidden = !scanMenu.hidden;
+    const opening = scanMenu.hidden;
+    closeDropdownPanels(scanMenu);
+    scanMenu.hidden = !opening;
   });
   scanMenu.addEventListener("click", (e) => e.stopPropagation());
   document.addEventListener("click", () => { scanMenu.hidden = true; });
 
-  qs("#btnScanNow").addEventListener("click", async () => {
+  qs("#btnScanQuick").addEventListener("click", async () => {
     scanMenu.hidden = true;
-    await Api.scanNow();
-    pollScanStatus();
-    toast("Scan triggered.");
+    try {
+      await Api.quickScanAll();
+      pollScanStatus();
+      toast("Quick scan triggered.");
+    } catch (err) {
+      toast(err.message, "bad");
+    }
   });
-  qs("#btnDeepScanAll").addEventListener("click", () => {
+  qs("#btnScanMass").addEventListener("click", () => {
     scanMenu.hidden = true;
-    qs("#dsmConfirm").checked = false;
-    qs("#dsmProceed").disabled = true;
-    showModal("#deepScanModal");
+    openScanConfirmModal("mass");
+  });
+  qs("#btnScanDeepAll").addEventListener("click", () => {
+    scanMenu.hidden = true;
+    openScanConfirmModal("deep");
+  });
+  qs("#btnScanReverseDns").addEventListener("click", () => {
+    scanMenu.hidden = true;
+    openScanConfirmModal("dns");
   });
 
-  qs("#btnAddSubnet").addEventListener("click", () => { qs("#smError").hidden = true; qs("#smCIDR").value = ""; qs("#smName").value = ""; showModal("#subnetModal"); });
+  qs("#btnAddSubnet").addEventListener("click", () => openSubnetModal(null));
   qs("#btnAddHost").addEventListener("click", () => { qs("#hamError").hidden = true; qs("#hamIP").value = ""; qs("#hamHostname").value = ""; qs("#hamNotes").value = ""; renderTagSelects(); showModal("#hostAddModal"); });
   qs("#btnTags").addEventListener("click", () => { renderTagManager(); showModal("#tagModal"); });
+  wireExport();
+  wireImport();
 
-  const accountMenu = qs("#accountMenu");
+  const accountMenu = registerDropdownPanel(qs("#accountMenu"));
   qs("#btnAccountMenu").addEventListener("click", (e) => {
     e.stopPropagation();
-    accountMenu.hidden = !accountMenu.hidden;
+    const opening = accountMenu.hidden;
+    closeDropdownPanels(accountMenu);
+    accountMenu.hidden = !opening;
   });
   accountMenu.addEventListener("click", (e) => e.stopPropagation());
   document.addEventListener("click", () => { accountMenu.hidden = true; });
@@ -1622,16 +2610,43 @@ async function removeSubnet(id) {
   await refreshHosts();
 }
 
+// Set while #subnetModal is open for renaming an existing subnet (see
+// openSubnetModal) rather than adding a new one; null means "add" mode.
+let editingSubnetId = null;
+
+/** Opens #subnetModal in "add" mode (sn omitted) or "edit" mode (existing
+ * subnet passed) — edit mode locks the CIDR field, since the IP range isn't
+ * editable after creation (UpsertAutoSubnet matches on it, and hosts
+ * reference the subnet by id, not by address range). */
+function openSubnetModal(sn) {
+  qs("#smError").hidden = true;
+  editingSubnetId = sn ? sn.id : null;
+  qs("#smHeading").textContent = sn ? "Edit subnet" : "Add subnet";
+  qs("#smCIDR").value = sn ? sn.cidr : "";
+  qs("#smCIDR").disabled = !!sn;
+  qs("#smCidrLock").hidden = !sn;
+  qs("#smName").value = sn ? (sn.name || "") : "";
+  qs("#smSubmit").textContent = sn ? "Save" : "Add & scan";
+  showModal("#subnetModal");
+}
+
 function wireSubnetForm() {
   wireModal("#subnetModal", "#smClose");
   qs("#smSubmit").addEventListener("click", async () => {
-    const cidr = qs("#smCIDR").value.trim();
     const name = qs("#smName").value.trim();
     try {
-      await Api.addSubnet(cidr, name);
-      closeModal("#subnetModal");
-      await refreshSubnets();
-      toast(`Subnet ${cidr} added. Scan triggered.`);
+      if (editingSubnetId) {
+        await Api.renameSubnet(editingSubnetId, name);
+        closeModal("#subnetModal");
+        await refreshSubnets();
+        toast("Subnet renamed.");
+      } else {
+        const cidr = qs("#smCIDR").value.trim();
+        await Api.addSubnet(cidr, name);
+        closeModal("#subnetModal");
+        await refreshSubnets();
+        toast(`Subnet ${cidr} added. Scan triggered.`);
+      }
     } catch (err) {
       qs("#smError").textContent = err.message;
       qs("#smError").hidden = false;
@@ -1840,20 +2855,68 @@ function wireRiskRuleModal() {
 }
 
 /* ---------------------------------------------------------------------- */
-/* deep scan confirm modal                                               */
+/* mass/deep/reverse-DNS scan confirm modal                              */
 /* ---------------------------------------------------------------------- */
 
-function wireDeepScanModal() {
-  wireModal("#deepScanModal", "#dsmClose");
-  qs("#dsmConfirm").addEventListener("change", (e) => {
-    qs("#dsmProceed").disabled = !e.target.checked;
+// One shared modal for every forced-technique action — they only differ in
+// copy and which endpoint Proceed calls.
+const SCAN_CONFIRM_COPY = {
+  mass: {
+    title: "Mass scan all hosts (nmap)",
+    body: "This forces an nmap sweep of the common-port list across every host, regardless of the configured scan method. It's noisier than the built-in prober and can take a while on a large network.",
+    confirmLabel: "I understand this forces nmap and may take a while",
+    proceedLabel: "Start mass scan",
+    api: () => Api.massScanAll(),
+    toastMessage: "Mass scan triggered — forcing an nmap sweep across every host.",
+  },
+  deep: {
+    title: "Deep scan all hosts (nmap)",
+    body: "This forces an nmap sweep of every TCP port (1–65535) on every host instead of the usual common-port list. It can take a long time on a large network, and it blocks the normal scheduled scan cycle from running until it finishes.",
+    confirmLabel: "I understand this will take a while and block normal scanning",
+    proceedLabel: "Start deep scan",
+    api: () => Api.deepScanAll(),
+    toastMessage: "Deep scan triggered — scanning every port on every host. This can take a long time on a large network.",
+  },
+  dns: {
+    title: "Reverse DNS scan all hosts",
+    body: "This sweeps every address in every subnet for a PTR record (dnsrecon if installed, otherwise dig -x per address), independent of ping/TCP/ARP discovery. Hosts found this way are recorded but not marked up until an open port confirms them. Can be slow on a large network without dnsrecon installed — check the tools icon in the top bar.",
+    confirmLabel: "I understand this may take a while, especially without dnsrecon",
+    proceedLabel: "Start reverse DNS scan",
+    api: () => Api.reverseDnsScanAll(),
+    toastMessage: "Reverse DNS scan triggered — sweeping every address for a PTR record.",
+  },
+};
+
+let pendingScanMode = null; // "mass" | "deep" — which one Proceed should run
+
+function openScanConfirmModal(mode) {
+  pendingScanMode = mode;
+  const copy = SCAN_CONFIRM_COPY[mode];
+  qs("#scmTitle").textContent = copy.title;
+  qs("#scmBody").textContent = copy.body;
+  qs("#scmConfirmLabel").textContent = copy.confirmLabel;
+  qs("#scmProceed").textContent = copy.proceedLabel;
+  qs("#scmConfirm").checked = false;
+  qs("#scmProceed").disabled = true;
+  showModal("#scanConfirmModal");
+}
+
+function wireScanConfirmModal() {
+  wireModal("#scanConfirmModal", "#scmClose");
+  qs("#scmConfirm").addEventListener("change", (e) => {
+    qs("#scmProceed").disabled = !e.target.checked;
   });
-  qs("#dsmCancel").addEventListener("click", () => closeModal("#deepScanModal"));
-  qs("#dsmProceed").addEventListener("click", async () => {
-    closeModal("#deepScanModal");
-    await Api.deepScanAll();
-    pollScanStatus();
-    toast("Deep scan triggered — scanning every port on every host. This can take a long time on a large network.", "warn");
+  qs("#scmCancel").addEventListener("click", () => closeModal("#scanConfirmModal"));
+  qs("#scmProceed").addEventListener("click", async () => {
+    closeModal("#scanConfirmModal");
+    const copy = SCAN_CONFIRM_COPY[pendingScanMode];
+    try {
+      await copy.api();
+      pollScanStatus();
+      toast(copy.toastMessage, "warn");
+    } catch (err) {
+      toast(err.message, "bad");
+    }
   });
 }
 
@@ -1935,6 +2998,12 @@ function wireSettings() {
     await refreshHosts();
     toast("All hosts cleared.");
   });
+
+  qs("#stMarkAllReviewed").addEventListener("click", async () => {
+    const { reviewed } = await Api.ackAllHostsNew();
+    await refreshHosts();
+    toast(reviewed > 0 ? `${reviewed} host(s) marked as reviewed.` : "No hosts were flagged as new.");
+  });
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1944,6 +3013,14 @@ function wireSettings() {
 let appStarted = false;
 
 function showLoginScreen() {
+  // Stop polling/SSE the moment the session is known dead — otherwise the
+  // 4s scan-status poll and the SSE reconnect both keep hitting the server
+  // with a doomed request forever (a session naturally expires after 24h,
+  // or a server restart wipes the in-memory session store), 401ing in the
+  // background with nothing on screen to show for it. Safe to call even
+  // when nothing is running yet (page just loaded, never logged in).
+  stopLiveUpdates();
+
   // Called redundantly whenever a stray in-flight request (a background
   // poll, an SSE reconnect) lands a 401 after the login screen is already
   // showing — e.g. right after logout. Only reset the form and steal focus
@@ -1976,22 +3053,55 @@ async function loadAppData() {
   renderRiskRules();
   renderScanMethodSettings(settings);
   renderVersionInfo(settings);
+  // Fetched separately, not part of the Promise.all above: PATH doesn't
+  // change over the life of the server, so a transient failure here just
+  // means trying again next login rather than something worth failing the
+  // rest of the app's data load over.
+  Api.toolStatus().then(renderToolStatus).catch(() => {});
+}
+
+/** Renders the combined tools pill (nmap/netdiscover/dnsrecon) shown before
+ * the live-connection icon: an at-a-glance "N/M available" count, with a
+ * hover panel (#toolStatusPanel, see .tool-status-wrap in style.css)
+ * breaking down each tool's availability and, when installed, its exact
+ * path — fetched once per login since PATH doesn't change over the life of
+ * a running server, unlike the polled scan-status/active-users pills next
+ * to it. The panel is a sibling element rather than a data-tooltip on the
+ * pill itself, since this function replaces the pill's whole className on
+ * every refresh below — any class living on the pill would get wiped. */
+function renderToolStatus(tools) {
+  const available = tools.filter((t) => t.available).length;
+  let pillClass = "pill-muted";
+  if (available === tools.length) pillClass = "pill-good";
+  else if (available === 0) pillClass = "pill-bad";
+  qs("#toolStatusCount").textContent = `${available}/${tools.length}`;
+  qs("#toolStatus").className = "pill " + pillClass;
+
+  const panel = qs("#toolStatusPanel");
+  panel.innerHTML = "";
+  for (const t of tools) {
+    panel.appendChild(el("div", { class: "tool-status-row" }, [
+      el("span", { class: "tool-status-mark " + (t.available ? "tool-status-ok" : "tool-status-bad"), text: t.available ? "✓" : "✗" }),
+      `${t.name} — ${t.available ? t.path : "not found on PATH"}`,
+    ]));
+  }
 }
 
 async function startApp() {
   showApp();
   if (appStarted) {
     await loadAppData(); // returning from a re-login after a session expiry
+    startLiveUpdates(); // stopLiveUpdates() tore these down when the session went stale
     return;
   }
   appStarted = true;
 
   graph = new Graph(qs("#graph"));
-  simpleGraph = new Graph(qs("#simpleGraph"), { animated: false });
   applyViewMode();
   wireTabs();
   wireGraphControls();
   wireViewToggle();
+  wireZoomControls();
   wireFilters();
   wireMiniDash();
   wireNotifications();
@@ -2001,14 +3111,12 @@ async function startApp() {
   wireTagManager();
   wireSettings();
   wireRiskRuleModal();
-  wireDeepScanModal();
+  wireScanConfirmModal();
   wireModal("#hostModal", "#hmClose");
 
   await loadAppData();
 
-  connectSSE();
-  pollScanStatus();
-  setInterval(pollScanStatus, 4000);
+  startLiveUpdates();
   setInterval(renderScanStatus, 1000); // ticks the "next scan in Ns" countdown between polls
   setInterval(renderNotifPanel, 30000); // keep relative timestamps fresh
   setInterval(renderHostList, 30000);

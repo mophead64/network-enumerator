@@ -4,7 +4,7 @@ A self-contained network discovery and enumeration tool. It runs a background sc
 
 > **Authorized use only.** This tool actively probes hosts and ports. Only run it against networks and systems you own or are explicitly authorized to scan.
 
-![Network Enumerator dashboard, showing the live topology graph and host list after scanning several subnets](docs/screenshots/net-scan-overview.png)
+![Network Enumerator dashboard, showing the live network graph and host list after scanning several subnets](docs/screenshots/net-scan-overview.png)
 
 ## What it does
 
@@ -12,17 +12,23 @@ A self-contained network discovery and enumeration tool. It runs a background sc
 
   ![A /22 subnet automatically split into three /24 buckets in the graph view](docs/screenshots/subnet-splitting.png)
 
-- **Finds hosts** with ICMP and TCP-based probing, and tracks them as up/down over time (a host is marked down after a configurable number of consecutive missed scans).
+- **Finds hosts** with ICMP and TCP-based probing, and tracks them as up/down over time (a host is marked down after a configurable number of consecutive missed scans). Hosts that don't answer ping/TCP/ARP but do resolve in reverse DNS are recorded as **unconfirmed** — a low-confidence hint that something's there — rather than promoted to up until an open port actually confirms it.
 - **Scans ports** against a curated list of common ports on every cycle, with an on-demand deep scan (all 65535 ports, or a full sweep with version detection) per host or across the whole network. Click any host for its status, tags, open ports (service, version, banner), and notes:
 
   ![Host detail view showing open ports, service/version info, and the deep scan control](docs/screenshots/viewing-host.png)
 
+- **Runs forced, on-demand scan modes** from "Scan now" alongside the regular background cycle: **Quick** (built-in TCP/ICMP prober only, fast), **Mass** (nmap forced across every host), **Deep** (nmap, all 65535 ports), and **Reverse DNS** (dnsrecon/`dig -x` only, no ping/TCP/ARP — for sweeping a segment without generating probe traffic).
 - **Uses `nmap` automatically when it's available** on `PATH` for richer results (service/product/version detection via `-sV`), and transparently falls back to a built-in Go TCP/ICMP prober when it isn't — no configuration required, and no root/`CAP_NET_RAW` needed either way.
 - **Uses `netdiscover` automatically when it's available**, as a supplementary ARP sweep on subnets the scanner is directly attached to (local L2 segments only — ARP doesn't route). It catches hosts that filter ICMP/TCP but still have to answer ARP (aggressive host firewalls, minimal-stack IoT/OT gear), and gets a MAC vendor lookup for free. On by default, toggleable per-instance from the Scanning section in Settings.
+- **Uses `dnsrecon` (or `dig -x` as a per-address fallback) automatically when available**, to reverse-resolve hostnames for addresses that stayed silent to every other probe. Whether `nmap`, `netdiscover`, and `dnsrecon` are currently available is shown up front in a topbar tools pill (hover for the resolved path of each), so a missing tool shows up before a scan action is rejected because of it, not after.
 - **Flags risky services** with a configurable risk-rules engine (port + optional service substring + optional "version below X" match → critical/warning/info), and flags suspect hosts (e.g. a MAC address answering for an unusually large number of addresses, typical of proxy ARP or a captive network). Rules ship pre-loaded for common risky services (Telnet, plaintext HTTP, outdated OpenSSH, exposed RDP/VNC, etc.) and are fully editable:
 
   ![Risk rules list and the add-rule form in Settings](docs/screenshots/risk-rules.png)
 
+- **Flags newly-discovered hosts** for manual review — a new host stays on the "New" list until someone acknowledges it from the Host modal, rather than silently dropping off after a timeout.
+- **Lets you add hosts and subnets manually**, alongside auto-discovery, from dedicated add-host/add-subnet panels.
+- **Switches between a graph view and a sortable table view** of the current hosts/subnets, and shows each subnet's name (when set) on both the graph and its individual hosts.
+- **Imports and exports scan data**: import hosts/ports from an existing `nmap`/masscan XML (`-oX`) scan run to seed or merge into the database, and export the current network map as CSV, JSON, a Mermaid diagram, or a native `.drawio` file (draw.io / mscae stencils for routers/servers/workstations, hosts grouped into squared-off subnet blocks, MAC addresses included) — no import step needed for the `.drawio` file, it opens directly in draw.io.
 - **Serves a live web UI** (dashboard, host list/detail, tagging, acknowledge/triage workflow, risk rules editor, settings) over plain HTTP, pushing updates to connected browsers via Server-Sent Events as scans complete.
 - Ships as **one static binary** with the frontend and a SQLite database engine embedded — nothing to install alongside it.
 
@@ -118,13 +124,19 @@ This produces `build/network-enumerator-linux-amd64`, `build/network-enumerator-
 
 ## Running as a container
 
-The `Dockerfile` is a two-stage build: it compiles the static binary in a `golang:1.22-alpine` build stage, then copies just that binary into `gcr.io/distroless/static-debian12:nonroot` — no shell, no package manager, minimal attack surface.
+The `Dockerfile` is a two-stage build: it compiles the static binary in a `golang:1.22-alpine` build stage, then copies just that binary into an `alpine:3.20` runtime stage with `nmap`, `netdiscover`, and `dnsrecon` installed — the same optional tools the app looks for on `PATH` when run directly on a host, now available inside the container too.
 
 ### Build and run locally
 
 ```bash
 docker build -t network-enumerator .
 docker run -p 8080:8080 -e ADMIN_PASSWORD='something-long-and-random' network-enumerator
+```
+
+ICMP ping needs a raw or unprivileged ICMP socket; without it it's silently skipped and host discovery falls back to TCP-only. Add `--cap-add=NET_RAW` to get full ICMP support:
+
+```bash
+docker run -p 8080:8080 --cap-add=NET_RAW -e ADMIN_PASSWORD='something-long-and-random' network-enumerator
 ```
 
 To persist data, mount a volume and point `DB_FILE` at it:
@@ -161,6 +173,7 @@ docker run -p 8080:8080 network-enumerator
 ## Notes on scanning behavior
 
 - **ICMP**: if the process doesn't have permission to open a raw or unprivileged ICMP socket, ICMP probing is silently disabled and host discovery falls back to TCP-only — logged once at startup, not treated as an error.
-- **nmap integration**: when used, it runs a TCP connect scan (`-sT`) against only the hosts the built-in prober already confirmed alive (`-Pn`), which is why it needs no elevated privileges — the same level the built-in TCP prober requires. Install `nmap` and put it on `PATH` and it's picked up automatically; nothing else to configure.
+- **nmap integration**: when used, it runs a TCP connect scan (`-sT`) against only the hosts the built-in prober already confirmed alive (`-Pn`), which is why it needs no elevated privileges — the same level the built-in TCP prober requires. Install `nmap` and put it on `PATH` and it's picked up automatically; nothing else to configure. The forced **Mass** and **Deep** scan modes (see [What it does](#what-it-does)) require `nmap` and are rejected up front if it's not on `PATH`.
 - **netdiscover integration**: only runs against subnets the scanner is directly attached to via a local interface (auto-discovered local subnets have one; manually-added or routed subnets don't, since ARP can't reach across a router). Each scan cycle, its results are unioned into that subnet's alive-host list *before* port scanning — so an ARP-only host (one the TCP/ICMP prober alone would miss entirely) still gets picked up and port-scanned like any other host, not just recorded as "exists." Its MAC/vendor findings only ever fill in what the kernel ARP table or nmap didn't already supply, never overwrite them. Failures (binary missing, sweep errors) are logged and swallowed — it's a supplementary source layered on top of the built-in prober, never the only way a host gets found. Enabled by default when the binary is on `PATH`; toggle it off from Settings if it's not wanted (e.g. to avoid active ARP traffic on a sensitive segment).
+- **Reverse DNS integration**: prefers `dnsrecon`'s single-process range sweep over spawning `dig -x` once per candidate address (a /24 with nothing else discovered is 254 `dig` subprocesses against one `dnsrecon` invocation), falling back to `dig -x` per-address when `dnsrecon` isn't on `PATH` or its sweep fails. A hostname found this way with no ping/TCP/ARP response lands the host as **unconfirmed**, never promoted to up until an open port confirms it. The forced **Reverse DNS** scan mode uses only this path — no ping, TCP, or ARP traffic at all.
 - **Risk rules and suspect-host detection** run entirely from data already collected during normal scanning — they don't trigger extra network activity.
