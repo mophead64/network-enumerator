@@ -37,6 +37,7 @@ func main() {
 	flag.StringVar(&port, "port", "8080", "HTTP port to listen on")
 	flag.StringVar(&port, "p", "8080", "shorthand for -port")
 	scanInterval := flag.Int("scan-interval", int(defCfg.Interval.Seconds()), "seconds between scan cycles")
+	topologyInterval := flag.Int("topology-interval", int(defCfg.TopologyInterval.Seconds()), "seconds between automatic topology (traceroute) scans")
 	hostConcurrency := flag.Int("host-concurrency", defCfg.HostConcurrency, "max hosts probed concurrently per subnet")
 	portConcurrency := flag.Int("port-concurrency", defCfg.PortConcurrency, "max ports probed concurrently per host")
 	missThreshold := flag.Int("miss-threshold", defCfg.MissThreshold, "consecutive missed scans before a host is marked down")
@@ -55,6 +56,7 @@ func main() {
 
 	cfg := discovery.DefaultConfig()
 	cfg.Interval = time.Duration(envInt("SCAN_INTERVAL_SECONDS", *scanInterval)) * time.Second
+	cfg.TopologyInterval = time.Duration(envInt("TOPOLOGY_INTERVAL_SECONDS", *topologyInterval)) * time.Second
 	cfg.HostConcurrency = envInt("HOST_CONCURRENCY", *hostConcurrency)
 	cfg.PortConcurrency = envInt("PORT_CONCURRENCY", *portConcurrency)
 	cfg.MissThreshold = envInt("MISS_THRESHOLD", *missThreshold)
@@ -133,8 +135,8 @@ func (w *statusWriter) WriteHeader(status int) {
 // still has the out-of-the-box credentials, a reminder to change them.
 func printStartupBanner(addr, dbPath string, cfg discovery.Config, usingDefaultCreds bool) {
 	log.Printf("network-enumerator %s (built %s)", version.Version, version.BuildDate)
-	log.Printf("network-enumerator starting — listen %s, scan interval %s, host concurrency %d, port concurrency %d, miss threshold %d, auto-discover local subnets %t",
-		addr, cfg.Interval, cfg.HostConcurrency, cfg.PortConcurrency, cfg.MissThreshold, cfg.AutoDiscoverLocal)
+	log.Printf("network-enumerator starting — listen %s, scan interval %s, topology interval %s, host concurrency %d, port concurrency %d, miss threshold %d, auto-discover local subnets %t",
+		addr, cfg.Interval, cfg.TopologyInterval, cfg.HostConcurrency, cfg.PortConcurrency, cfg.MissThreshold, cfg.AutoDiscoverLocal)
 	if nmapPath, ok := discovery.NmapPath(); ok {
 		log.Printf("nmap found at %s — used for scanning when the scan method is set to auto or nmap", nmapPath)
 	} else {

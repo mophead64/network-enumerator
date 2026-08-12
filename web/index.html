@@ -67,6 +67,7 @@
           <button id="btnScanMass" class="account-menu-item" title="Force an nmap sweep (common ports) across every host">Mass scan (nmap)…</button>
           <button id="btnScanDeepAll" class="account-menu-item" title="Force an nmap sweep of every TCP port (1-65535) on every host — much slower than a normal scan">Deep scan (nmap, all ports)…</button>
           <button id="btnScanReverseDns" class="account-menu-item" title="Sweep every address for a PTR record (dnsrecon if installed, else dig -x), independent of ping/TCP/ARP discovery">Reverse DNS scan…</button>
+          <button id="btnScanTopology" class="account-menu-item" title="Traceroute to one representative host per subnet to discover the router links between subnets, shown on the Map view">Topology scan (traceroute)…</button>
         </div>
       </div>
       <div class="notif-wrap">
@@ -74,6 +75,7 @@
         <div id="viewMenu" class="notif-panel account-menu" hidden>
           <button id="btnViewGraph" class="account-menu-item" data-view="graph" title="Animated, physics-simulated graph of subnets and hosts">Graph view</button>
           <button id="btnViewTable" class="account-menu-item" data-view="table" title="Subnets and hosts as searchable tables — expand a subnet row to see its hosts">Table view</button>
+          <button id="btnViewMap" class="account-menu-item" data-view="map" title="Static network map: subnets as boxes with host icons, router links between them from the traceroute-based topology scan">Map view</button>
         </div>
       </div>
       <button id="btnTags" class="btn">Tags</button>
@@ -167,6 +169,39 @@
           </thead>
           <tbody id="subnetsTableBody"></tbody>
         </table>
+      </div>
+    </section>
+
+    <section class="map-view-pane" id="mapViewPane">
+      <div class="map-view-scroll">
+        <svg id="mapSvg" xmlns="http://www.w3.org/2000/svg"></svg>
+      </div>
+      <div class="graph-overlay">
+        <div class="legend" id="mapLegend">
+          <div class="legend-row"><span class="swatch status-good"></span>up</div>
+          <div class="legend-row"><span class="swatch status-critical"></span>down</div>
+          <div class="legend-row"><span class="swatch swatch-subnet"></span>subnet</div>
+          <div class="legend-row"><span class="swatch swatch-host-origin"></span>this host</div>
+          <div class="legend-row"><span class="swatch swatch-host-router"></span>router/gateway (identified)</div>
+          <div class="legend-row"><span class="swatch swatch-transit"></span>undocumented transit</div>
+          <div class="legend-row"><span class="map-legend-line map-link-confirmed"></span>confirmed hop</div>
+          <div class="legend-row"><span class="map-legend-line map-link-inferred"></span>inferred / no response</div>
+        </div>
+        <button id="btnMapRefresh" type="button" class="btn btn-small graph-collapse-btn">Refresh topology</button>
+      </div>
+      <div class="zoom-controls">
+        <button type="button" id="btnMapZoomIn" title="Zoom in" aria-label="Zoom in">+</button>
+        <button type="button" id="btnMapZoomReset" title="Reset zoom" aria-label="Reset zoom">⊙</button>
+        <button type="button" id="btnMapZoomOut" title="Zoom out" aria-label="Zoom out">−</button>
+      </div>
+      <div class="graph-hint muted small">scroll to zoom · drag to pan · click a host for details · click a router link for hop detail and an on-demand mtr report</div>
+      <div id="mapEmptyState" class="empty-state" hidden>
+        <p>No topology data yet.</p>
+        <p class="muted small">Run a Topology scan from the "Scan now ▾" menu (needs traceroute installed) to discover the router links between subnets.</p>
+      </div>
+      <div id="mapLinkTooltip" class="map-tooltip" hidden>
+        <button class="btn-icon map-tooltip-close" id="mapTooltipClose" aria-label="Close">✕</button>
+        <div id="mapTooltipBody"></div>
       </div>
     </section>
 
@@ -336,6 +371,13 @@
           <tbody id="hmPorts"></tbody>
         </table>
         <button id="hmDeepScan" class="btn btn-small" title="Scan all 65535 TCP ports on this host, not just the common list — slower, run on demand">Deep scan (all ports)</button>
+      </div>
+
+      <div class="hm-section" id="hmMtrSection" hidden>
+        <h3>Network path</h3>
+        <p class="muted small">Identified as a router/gateway (based on its address/hostname — a heuristic, not confirmed). Run an on-demand <code>mtr</code> report for deeper loss/jitter stats to it.</p>
+        <button id="hmRunMtr" class="btn btn-small">Run mtr…</button>
+        <div id="hmMtrResult" class="mtr-result"></div>
       </div>
 
       <div class="hm-section">

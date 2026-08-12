@@ -22,6 +22,15 @@ type Config struct {
 	DNSTimeout        time.Duration
 	MissThreshold     int // consecutive misses before a host is marked down
 	AutoDiscoverLocal bool
+
+	// TopologyInterval is how often the automatic topology scan (traceroute
+	// to one host per subnet — see scanSubnetTopology) re-runs on its own
+	// ticker, independent of Interval. Router topology changes far less
+	// often than host/port state does, and a single subnet's trace can take
+	// several seconds worst-case, so this defaults much longer than the
+	// regular scan interval rather than retracing every subnet on every
+	// host-discovery cycle.
+	TopologyInterval time.Duration
 }
 
 func DefaultConfig() Config {
@@ -34,6 +43,7 @@ func DefaultConfig() Config {
 		DNSTimeout:        500 * time.Millisecond,
 		MissThreshold:     3,
 		AutoDiscoverLocal: true,
+		TopologyInterval:  5 * time.Minute,
 	}
 }
 
@@ -47,10 +57,11 @@ func DefaultConfig() Config {
 type ScanMode string
 
 const (
-	ScanModeQuick      ScanMode = "quick" // built-in TCP/ICMP prober, common ports — fast, doesn't need nmap
-	ScanModeMass       ScanMode = "mass"  // nmap forced, common ports — broad nmap sweep across every host
-	ScanModeDeep       ScanMode = "deep"  // nmap forced, all 65535 ports — thorough but slow
-	ScanModeReverseDNS ScanMode = "dns"   // dnsrecon/dig -x only, no ping/TCP/ARP — see scanSubnetReverseDNS
+	ScanModeQuick      ScanMode = "quick"    // built-in TCP/ICMP prober, common ports — fast, doesn't need nmap
+	ScanModeMass       ScanMode = "mass"     // nmap forced, common ports — broad nmap sweep across every host
+	ScanModeDeep       ScanMode = "deep"     // nmap forced, all 65535 ports — thorough but slow
+	ScanModeReverseDNS ScanMode = "dns"      // dnsrecon/dig -x only, no ping/TCP/ARP — see scanSubnetReverseDNS
+	ScanModeTopology   ScanMode = "topology" // traceroute to one host per subnet — see scanSubnetTopology
 )
 
 type Scanner struct {
@@ -62,14 +73,18 @@ type Scanner struct {
 	statusMu sync.Mutex
 	status   model.ScanStatus
 
-	trigger        chan struct{} // unforced: respects the configured scan-method setting
-	triggerQuick   chan struct{}
-	triggerMass    chan struct{}
-	triggerDeep    chan struct{}
-	triggerReverse chan struct{}
+	trigger         chan struct{} // unforced: respects the configured scan-method setting
+	triggerQuick    chan struct{}
+	triggerMass     chan struct{}
+	triggerDeep     chan struct{}
+	triggerReverse  chan struct{}
+	triggerTopology chan struct{}
 
 	deepScanMu   sync.Mutex
 	deepScanning map[int64]bool // hostID -> a deep scan is currently running for it
+
+	topologyMu  sync.Mutex
+	topologySig map[int64]string // subnetID -> signature of its last-stored hop set, see scanSubnetTopology
 }
 
 func NewScanner(st *store.Store, cfg Config, notify func(model.Event)) *Scanner {
@@ -79,17 +94,19 @@ func NewScanner(st *store.Store, cfg Config, notify func(model.Event)) *Scanner 
 		pinger = nil
 	}
 	return &Scanner{
-		st:             st,
-		cfg:            cfg,
-		pinger:         pinger,
-		notify:         notify,
-		status:         model.ScanStatus{IntervalSec: int(cfg.Interval.Seconds())},
-		trigger:        make(chan struct{}, 1),
-		triggerQuick:   make(chan struct{}, 1),
-		triggerMass:    make(chan struct{}, 1),
-		triggerDeep:    make(chan struct{}, 1),
-		triggerReverse: make(chan struct{}, 1),
-		deepScanning:   make(map[int64]bool),
+		st:              st,
+		cfg:             cfg,
+		pinger:          pinger,
+		notify:          notify,
+		status:          model.ScanStatus{IntervalSec: int(cfg.Interval.Seconds())},
+		trigger:         make(chan struct{}, 1),
+		triggerQuick:    make(chan struct{}, 1),
+		triggerMass:     make(chan struct{}, 1),
+		triggerDeep:     make(chan struct{}, 1),
+		triggerReverse:  make(chan struct{}, 1),
+		triggerTopology: make(chan struct{}, 1),
+		deepScanning:    make(map[int64]bool),
+		topologySig:     make(map[int64]string),
 	}
 }
 
@@ -109,11 +126,28 @@ func (s *Scanner) Status() model.ScanStatus {
 // interval timer — the regular, unforced cycle that still respects the
 // configured scan-method setting. Used for system-triggered rescans (a
 // subnet was just added, data was imported, ...), not the user-facing
-// Quick/Mass/Deep actions. Non-blocking: if a scan is already queued to
-// start, this is a no-op.
+// Quick/Mass/Deep actions.
+//
+// Also queues an immediate topology retrace (see TriggerTopologyScanAll)
+// rather than leaving a newly-added subnet waiting on the much longer
+// TopologyInterval ticker before its router links show up on the Map view
+// — "something changed enough to rescan host/port state right now"
+// reasonably means "the subnet-to-subnet map may have changed too". This
+// is cheap to do speculatively: a retrace only ever broadcasts a
+// topology_updated event when the traced path actually differs from what
+// was already stored (see Scanner.topologyChanged), so triggering it here
+// even when nothing about the topology actually changed doesn't spam the
+// UI, just costs the traceroute itself.
+//
+// Non-blocking: if either scan is already queued to start, that one is a
+// no-op.
 func (s *Scanner) TriggerNow() {
 	select {
 	case s.trigger <- struct{}{}:
+	default:
+	}
+	select {
+	case s.triggerTopology <- struct{}{}:
 	default:
 	}
 }
@@ -166,16 +200,41 @@ func (s *Scanner) TriggerReverseDNSScanAll() {
 	}
 }
 
+// TriggerTopologyScanAll requests an immediate scan cycle that traces the
+// path (via traceroute) to one representative host per subnet — the
+// "Topology scan" action that populates the Map view / draw.io export's
+// router links (see scanSubnetTopology). Non-blocking: if one is already
+// queued, this is a no-op.
+func (s *Scanner) TriggerTopologyScanAll() {
+	select {
+	case s.triggerTopology <- struct{}{}:
+	default:
+	}
+}
+
+// Run starts the scanner's background loop: the regular host/port discovery
+// cycle on its own ticker (cfg.Interval), and the topology (traceroute)
+// cycle on its own, much longer ticker (cfg.TopologyInterval) — see
+// scanSubnetTopology's doc comment for why they're independent rather than
+// topology tracing running as part of every regular cycle. Both run once
+// immediately at startup (topology after the first regular cycle, so it has
+// actual hosts to trace to) rather than waiting a full interval for the
+// first result.
 func (s *Scanner) Run(ctx context.Context) {
 	s.runOnce(ctx, "")
+	s.runOnce(ctx, ScanModeTopology)
 	ticker := time.NewTicker(s.cfg.Interval)
 	defer ticker.Stop()
+	topologyTicker := time.NewTicker(s.cfg.TopologyInterval)
+	defer topologyTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			s.runOnce(ctx, "")
+		case <-topologyTicker.C:
+			s.runOnce(ctx, ScanModeTopology)
 		case <-s.trigger:
 			s.runOnce(ctx, "")
 			ticker.Reset(s.cfg.Interval)
@@ -191,6 +250,9 @@ func (s *Scanner) Run(ctx context.Context) {
 		case <-s.triggerReverse:
 			s.runOnce(ctx, ScanModeReverseDNS)
 			ticker.Reset(s.cfg.Interval)
+		case <-s.triggerTopology:
+			s.runOnce(ctx, ScanModeTopology)
+			topologyTicker.Reset(s.cfg.TopologyInterval)
 		}
 	}
 }
@@ -238,6 +300,11 @@ func (s *Scanner) runOnce(ctx context.Context, mode ScanMode) {
 			}
 			if created {
 				s.emit("new_subnet", fmt.Sprintf("Discovered local subnet %s on %s", l.CIDR, l.Iface), id)
+				// A newly-appeared local interface subnet (a VPN connecting,
+				// a new NIC, ...) should get its Map view link traced
+				// promptly too, not wait out the rest of TopologyInterval —
+				// same reasoning as TriggerNow's own topology trigger.
+				s.TriggerTopologyScanAll()
 			}
 		}
 	}
@@ -333,6 +400,9 @@ func (s *Scanner) scanSubnet(ctx context.Context, sn model.Subnet, mode ScanMode
 	if mode == ScanModeReverseDNS {
 		return s.scanSubnetReverseDNS(ctx, sn)
 	}
+	if mode == ScanModeTopology {
+		return s.scanSubnetTopology(ctx, sn)
+	}
 	deep := mode == ScanModeDeep
 	if method, nmapPath := s.resolveScanMethod(mode); method == "nmap" {
 		return s.scanSubnetNmap(ctx, sn, deep, nmapPath)
@@ -371,6 +441,93 @@ func (s *Scanner) scanSubnetReverseDNS(ctx context.Context, sn model.Subnet) int
 		log.Printf("touch subnet scan: %v", err)
 	}
 	return len(confirmed)
+}
+
+// topologyMaxHops/topologyHopTimeout bound a single traceroute run: 30 hops
+// is traceroute's own conventional default (enough for any realistic path
+// on a private network, several times over), and 800ms per unanswered hop
+// keeps a subnet with several unresponsive hops from stalling the cycle for
+// too long while still giving a real router a fair chance to reply.
+const (
+	topologyMaxHops    = 30
+	topologyHopTimeout = 800 * time.Millisecond
+)
+
+// scanSubnetTopology is the "Topology scan" action: traces the path from
+// this host to one representative host in sn — preferring an inferred
+// gateway, else the numerically lowest live IP (see pickTopologyTarget) —
+// and stores every hop (see store.ReplaceSubnetTopologyHops) for
+// BuildTopologyGraph to turn into the subnet-to-subnet router links the Map
+// view and draw.io export draw. A no-op (logged, not an error) when
+// traceroute isn't installed or sn has no host currently marked up to trace
+// to — the same "just skip this cycle" pattern netdiscoverAugment uses for
+// a missing/inapplicable optional tool.
+func (s *Scanner) scanSubnetTopology(ctx context.Context, sn model.Subnet) int {
+	path, ok := TraceroutePath()
+	if !ok {
+		return 0
+	}
+	hosts, err := s.st.ListHosts()
+	if err != nil {
+		log.Printf("topology scan %s: list hosts: %v", sn.CIDR, err)
+		return 0
+	}
+	target := pickTopologyTarget(sn.ID, hosts)
+	if target == "" {
+		return 0
+	}
+
+	traced, err := RunTraceroute(ctx, path, target, topologyMaxHops, topologyHopTimeout)
+	if err != nil {
+		log.Printf("topology scan %s -> %s: %v", sn.CIDR, target, err)
+		return 0
+	}
+	if len(traced) == 0 {
+		return 0
+	}
+
+	hops := make([]model.TopologyHop, len(traced))
+	for i, h := range traced {
+		hops[i] = model.TopologyHop{
+			SubnetID: sn.ID, HopIndex: h.Index, IP: h.IP, Responded: h.Responded,
+			RTTMs: h.RTTMs, LossPct: h.LossPct, Method: "traceroute",
+		}
+	}
+	if err := s.st.ReplaceSubnetTopologyHops(sn.ID, hops); err != nil {
+		log.Printf("topology scan %s: store hops: %v", sn.CIDR, err)
+		return 0
+	}
+	if err := s.st.TouchSubnetScan(sn.ID); err != nil {
+		log.Printf("touch subnet scan: %v", err)
+	}
+	if s.topologyChanged(sn.ID, traced) {
+		s.emit("topology_updated", fmt.Sprintf("Topology scan updated %s (%d hop(s) to %s)", sn.CIDR, len(hops), target), sn.ID)
+	}
+	return len(hops)
+}
+
+// topologyChanged reports whether traced differs from the last hop set
+// scanSubnetTopology stored for subnetID, so the automatic topology
+// ticker — which retraces every subnet on every tick regardless of whether
+// the route actually changed — only broadcasts a topology_updated event
+// (and so only wakes up the frontend's Map view) when there's something
+// genuinely new to show, the same "only notify on real change" rule
+// new_host/new_port/host_down already follow elsewhere in this file.
+// Signatures are kept in memory only: a fresh process (or the very first
+// scan of a subnet) always counts as changed, which is the right default —
+// there's nothing to compare against yet.
+func (s *Scanner) topologyChanged(subnetID int64, traced []Hop) bool {
+	sig := make([]byte, 0, len(traced)*20)
+	for _, h := range traced {
+		sig = append(sig, []byte(fmt.Sprintf("%d:%s:%t|", h.Index, h.IP, h.Responded))...)
+	}
+	s.topologyMu.Lock()
+	defer s.topologyMu.Unlock()
+	if s.topologySig[subnetID] == string(sig) {
+		return false
+	}
+	s.topologySig[subnetID] = string(sig)
+	return true
 }
 
 // netdiscoverPath resolves whether ARP-based discovery via netdiscover

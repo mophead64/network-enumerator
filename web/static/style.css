@@ -267,6 +267,74 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .table-view-heading { margin: 20px 0 8px; font-size: 13px; color: var(--text-secondary); }
 .table-view-heading:first-child { margin-top: 12px; }
 
+/* ---- map view: static subnet/router-link layout — see renderMapView.    */
+/* Reuses .graph-overlay/.legend/.graph-hint/.empty-state/                 */
+/* .graph-collapse-btn from the graph pane above rather than redefining    */
+/* them. */
+.layout.map-view .graph-pane { display: none; }
+.map-view-pane { display: none; flex: 1; min-height: 0; position: relative; overflow: hidden; }
+.layout.map-view .map-view-pane { display: flex; }
+.map-view-scroll {
+  flex: 1;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 1px 1px, var(--grid) 1px, transparent 0) 0 0/22px 22px,
+    var(--surface-2);
+}
+/* Panned/zoomed via #mapViewportGroup's transform (see wireMapPanZoom) —
+ * same drag-to-pan/scroll-to-zoom interaction as the graph pane's canvas,
+ * not native scrolling, so content stays put and only the transform group
+ * inside the (fixed-size) SVG moves. */
+#mapSvg { display: block; width: 100%; height: 100%; cursor: grab; }
+#mapSvg:active { cursor: grabbing; }
+
+.swatch-transit { background: none; border: 2px dashed var(--text-muted); border-radius: 3px; }
+.swatch-host-router { background: color-mix(in srgb, var(--series-1) 30%, var(--surface-1)); border: 2px solid var(--series-1); border-radius: 3px; }
+.swatch-host-origin { background: color-mix(in srgb, var(--status-good) 30%, var(--surface-1)); border: 2px solid var(--status-good); border-radius: 3px; }
+.map-legend-line { display: inline-block; width: 20px; height: 0; border-top: 2px solid var(--text-secondary); }
+.map-link-inferred { border-top-style: dashed; border-top-color: var(--status-critical); }
+
+.map-subnet-rect { fill: var(--surface-1); stroke: var(--text-muted); stroke-width: 2; }
+.map-subnet-label { fill: var(--text-secondary); font: 600 13px system-ui, sans-serif; }
+.map-transit-rect { fill: var(--surface-1); stroke: var(--text-muted); stroke-width: 1.5; stroke-dasharray: 5 4; }
+.map-transit-label { fill: var(--text-muted); font: italic 11px system-ui, sans-serif; }
+.map-host-node { cursor: pointer; }
+.map-host-square { fill: var(--surface-1); stroke: var(--text-muted); stroke-width: 1.5; }
+.map-host-square-router { fill: color-mix(in srgb, var(--series-1) 30%, var(--surface-1)); stroke: var(--series-1); }
+.map-host-square-origin { fill: color-mix(in srgb, var(--status-good) 30%, var(--surface-1)); stroke: var(--status-good); stroke-width: 2; }
+.map-host-node:hover .map-host-square { stroke: var(--series-1); stroke-width: 2; }
+.map-host-status-dot { stroke: var(--surface-2); stroke-width: 1; }
+.map-host-label { fill: var(--text-muted); font: 9px system-ui, sans-serif; }
+.map-edge { stroke: var(--text-secondary); stroke-width: 2; cursor: pointer; }
+.map-edge-inferred { stroke: var(--status-critical); stroke-dasharray: 6 4; }
+.map-router-node { cursor: pointer; }
+.map-router-rect { fill: var(--surface-3); stroke: var(--series-1); stroke-width: 1.5; }
+.map-router-rect-inferred { stroke: var(--status-critical); }
+.map-router-label { fill: var(--text-secondary); font: 10px system-ui, sans-serif; pointer-events: none; }
+
+.map-tooltip {
+  position: absolute;
+  z-index: 5;
+  max-width: 260px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 30px 10px 12px;
+  font-size: 12px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+}
+.map-tooltip-close { position: absolute; top: 4px; right: 6px; }
+.map-tooltip-row { margin-bottom: 4px; }
+.map-tooltip-actions { margin-top: 8px; display: flex; gap: 8px; align-items: center; }
+
+/* Unlike the graph pane's #emptyState (shown only when there's truly
+ * nothing to interact with), #mapEmptyState can be showing while a fully
+ * interactive subnet/host map sits underneath it — it's just "no topology
+ * scan yet", not "nothing here". The base .empty-state's full-pane overlay
+ * would otherwise silently swallow every click/drag on the map behind it,
+ * including the zoom buttons. */
+#mapEmptyState { pointer-events: none; }
+
 .data-table { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 12px; }
 .data-table th {
   text-align: left; color: var(--text-muted); font-weight: 500; padding: 6px 8px;
@@ -591,6 +659,8 @@ textarea { resize: vertical; }
 .hm-callout-critical { border-color: color-mix(in srgb, var(--status-critical) 45%, transparent); background: color-mix(in srgb, var(--status-critical) 12%, transparent); }
 .hm-callout-warning { border-color: color-mix(in srgb, var(--status-warning) 45%, transparent); background: color-mix(in srgb, var(--status-warning) 14%, transparent); }
 .hm-callout-info { border-color: color-mix(in srgb, var(--series-1) 40%, transparent); background: color-mix(in srgb, var(--series-1) 10%, transparent); }
+
+.mtr-result { margin-top: 8px; display: flex; flex-direction: column; gap: 2px; }
 
 /* ---- settings tab ---- */
 .settings-scroll { overflow-y: auto; flex: 1; padding: 14px; display: flex; flex-direction: column; gap: 20px; }

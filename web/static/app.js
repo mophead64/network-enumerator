@@ -214,7 +214,11 @@ const Api = {
   massScanAll: () => Api._req("POST", "/api/scan/mass"),
   deepScanAll: () => Api._req("POST", "/api/scan/deep"),
   reverseDnsScanAll: () => Api._req("POST", "/api/scan/reverse-dns"),
+  topologyScanAll: () => Api._req("POST", "/api/scan/topology"),
   scanStatus: () => Api._req("GET", "/api/scan/status"),
+
+  topology: () => Api._req("GET", "/api/topology"),
+  runTopologyMtr: (ip) => Api._req("POST", "/api/topology/mtr", { ip }),
 };
 
 /* ---------------------------------------------------------------------- */
@@ -240,14 +244,19 @@ const state = {
   notifUnread: new Set(), // event ids not yet seen (drives the bell badge count)
   pendingTagAdds: [], // staged in the host modal until Save is clicked
   pendingTagRemoves: [],
-  // "graph" | "table" — table view swaps the animated canvas out entirely
-  // for a searchable, expandable subnet/host table. Persisted per browser,
-  // not per account, since it's about viewing preference.
-  viewMode: localStorage.getItem("viewMode") === "table" ? "table" : "graph",
+  // "graph" | "table" | "map" — table view swaps the animated canvas out
+  // entirely for a searchable, expandable subnet/host table; map view swaps
+  // it for the static router-topology layout (see renderMapView). Persisted
+  // per browser, not per account, since it's about viewing preference.
+  viewMode: ["table", "map"].includes(localStorage.getItem("viewMode")) ? localStorage.getItem("viewMode") : "graph",
   // Subnet ids expanded in the table view — independent of the graph's
   // collapsedSubnets (opposite default: table rows start collapsed, so
   // this tracks which ones the user opened, not which they closed).
   tableExpandedSubnets: new Set(),
+  // Cached GET /api/topology result (see renderMapView/downloadDrawioDiagram)
+  // — null until the first fetch, {edges: [], transit: []} once loaded, so
+  // "haven't checked yet" and "checked, nothing scanned" stay distinguishable.
+  topology: null,
 };
 
 function subnetById(id) { return state.subnets.find((s) => s.id === id); }
@@ -1071,6 +1080,315 @@ function renderTableView() {
   renderSubnetsTable();
 }
 
+/* ---------------------------------------------------------------------- */
+/* map view (static subnet/router-link layout) — see computeTopologyLayout */
+/* ---------------------------------------------------------------------- */
+
+function svgEl(tag, attrs, children) {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k.startsWith("on") && typeof v === "function") node.addEventListener(k.slice(2), v);
+    else if (v !== null && v !== undefined) node.setAttribute(k, v);
+  }
+  for (const c of children || []) {
+    if (c === null || c === undefined) continue;
+    node.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+  }
+  return node;
+}
+
+const MAP_SUBNET_ROW_Y = 30;
+
+/** Map view's own pan/zoom state — separate from Graph's transform since
+ * the two views are never visible at once but each remembers its own
+ * position independently. Panning drags #mapViewportGroup directly (drag-
+ * to-pan/scroll-to-zoom, same interaction as the Graph canvas) rather than
+ * relying on native scrolling — see wireMapPanZoom. */
+const mapView = {
+  transform: { x: 40, y: 40, k: 1 },
+  panning: null,
+  dragMoved: false, // true once a mousedown+move exceeds the click-vs-drag threshold — see wireMapPanZoom
+  ZOOM_MIN: 0.15,
+  ZOOM_MAX: 4,
+};
+
+function applyMapTransform() {
+  const g = qs("#mapViewportGroup");
+  if (g) g.setAttribute("transform", `translate(${mapView.transform.x},${mapView.transform.y}) scale(${mapView.transform.k})`);
+}
+
+/** Sizes #mapSvg to fill its container (like Graph._resize does for the
+ * canvas) — content is positioned by #mapViewportGroup's transform, not by
+ * the SVG's own viewBox/size, so this only needs to run on load and on
+ * window resize, not on every render. */
+function resizeMapSvg() {
+  const svg = qs("#mapSvg");
+  const rect = svg.parentElement.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+  svg.setAttribute("width", rect.width);
+  svg.setAttribute("height", rect.height);
+  svg.setAttribute("viewBox", `0 0 ${rect.width} ${rect.height}`);
+}
+
+/** Zooms Map view by factor, keeping the point at SVG-local (sx, sy) fixed
+ * under the cursor — same math as Graph._zoomAt. */
+function mapZoomAt(sx, sy, factor) {
+  const t = mapView.transform;
+  const beforeX = (sx - t.x) / t.k, beforeY = (sy - t.y) / t.k;
+  t.k = Math.min(mapView.ZOOM_MAX, Math.max(mapView.ZOOM_MIN, t.k * factor));
+  const afterX = (sx - t.x) / t.k, afterY = (sy - t.y) / t.k;
+  t.x += (afterX - beforeX) * t.k;
+  t.y += (afterY - beforeY) * t.k;
+  applyMapTransform();
+}
+
+/** +/- zoom buttons: zooms centered on the pane, same as Graph.zoomBy. */
+function mapZoomBy(factor) {
+  const svg = qs("#mapSvg");
+  const rect = svg.getBoundingClientRect();
+  mapZoomAt(rect.width / 2, rect.height / 2, factor);
+}
+
+function mapResetZoom() {
+  mapView.transform = { x: 40, y: 40, k: 1 };
+  applyMapTransform();
+}
+
+/** Wires drag-to-pan and scroll-to-zoom on #mapSvg — mousedown/mousemove/
+ * mouseup mirror Graph._onMouseDown/_onMouseMove/_onMouseUp (window-level
+ * move/up so a drag that leaves the SVG mid-gesture still tracks and
+ * releases correctly), and dragMoved suppresses a host dot's or router
+ * link's click handler from firing after an actual drag — the same
+ * distinction Graph._dragMoved draws for its own canvas. */
+function wireMapPanZoom() {
+  const svg = qs("#mapSvg");
+  svg.addEventListener("mousedown", (e) => {
+    mapView.panning = { startX: e.clientX, startY: e.clientY, ox: mapView.transform.x, oy: mapView.transform.y };
+    mapView.dragMoved = false;
+  });
+  window.addEventListener("mousemove", (e) => {
+    if (!mapView.panning) return;
+    const dx = e.clientX - mapView.panning.startX, dy = e.clientY - mapView.panning.startY;
+    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) mapView.dragMoved = true;
+    mapView.transform.x = mapView.panning.ox + dx;
+    mapView.transform.y = mapView.panning.oy + dy;
+    applyMapTransform();
+  });
+  window.addEventListener("mouseup", () => { mapView.panning = null; });
+  svg.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const rect = svg.getBoundingClientRect();
+    mapZoomAt(e.clientX - rect.left, e.clientY - rect.top, Math.exp(-e.deltaY * 0.001));
+  }, { passive: false });
+  window.addEventListener("resize", resizeMapSvg);
+}
+
+/** Loads the merged topology graph into state.topology — once per session
+ * unless force is set (the "Refresh topology" button, or right after
+ * triggering a topology scan). A fetch failure just leaves an empty graph
+ * rather than blocking the rest of the Map view from rendering the plain
+ * subnet/host grid. */
+async function loadTopology(force) {
+  if (state.topology && !force) return state.topology;
+  try {
+    state.topology = await Api.topology();
+  } catch (err) {
+    state.topology = { edges: [], transit: [] };
+  }
+  return state.topology;
+}
+
+/** One host's marker at its computeSubnetLayout grid cell: a small square
+ * (not a full router/server/workstation glyph — that detail belongs to the
+ * draw.io export a user actually files away; this is meant as a quick,
+ * glanceable in-app map) with its status dot badging the top-left corner,
+ * and IP/hostname printed below it — cell.h (LAYOUT.ICON_H) plus the row
+ * spacing's LAYOUT.LABEL_H gap below it is exactly the room
+ * computeSubnetLayout already reserves per host for this.
+ *
+ * A host inferHostKind identifies as a router/gateway (e.g. a .1 address)
+ * sits in its subnet's box exactly like any other host — same square, same
+ * green/red status dot — just tinted blue so it stands out as a likely
+ * ingress/egress point without needing a separate node type; the host
+ * modal (opened the same way any host's is) is what surfaces the
+ * "identified as router/gateway" callout and the on-demand mtr action.
+ *
+ * originHostId is the id of whichever host, if any, this app itself is
+ * running on (see computeTopologyLayout) — that one gets its own distinct
+ * tint instead, taking precedence over the router tint if a host somehow
+ * matches both. There's no separate "this host" node anymore: it's always
+ * one of the machine's own already-discovered hosts, highlighted in place
+ * rather than drawn as a synthetic extra. */
+function mapHostSquare(cell, originHostId) {
+  const h = cell.host;
+  const isOrigin = h.id === originHostId;
+  const isRouter = !isOrigin && inferHostKind(h) === "router";
+  const size = 16;
+  const cx = cell.x + cell.w / 2;
+  const sqX = cx - size / 2, sqY = cell.y + (LAYOUT.ICON_H - size) / 2;
+  const g = svgEl("g", {
+    class: "map-host-node",
+    onclick: (e) => { e.stopPropagation(); if (!mapView.dragMoved) openHostModal(h.id); },
+  });
+  const squareClass = isOrigin ? " map-host-square-origin" : isRouter ? " map-host-square-router" : "";
+  g.appendChild(svgEl("rect", { class: "map-host-square" + squareClass, x: sqX, y: sqY, width: size, height: size, rx: 2 }));
+  g.appendChild(svgEl("circle", { class: "map-host-status-dot", cx: sqX, cy: sqY, r: 4, fill: statusColorVar(h.status) }));
+  const labelY = cell.y + LAYOUT.ICON_H + 10;
+  g.appendChild(svgEl("text", { class: "map-host-label", x: cx, y: labelY, "text-anchor": "middle" }, [h.ip]));
+  if (h.hostname) {
+    g.appendChild(svgEl("text", { class: "map-host-label", x: cx, y: labelY + 12, "text-anchor": "middle" }, [h.hostname]));
+  }
+  const suffix = isOrigin ? " (this host)" : isRouter ? " (identified as router/gateway)" : "";
+  g.appendChild(svgEl("title", {}, [`${h.ip}${h.hostname ? " — " + h.hostname : ""}${suffix}`]));
+  return g;
+}
+
+function mapSubnetGroup(box, originHostId) {
+  const g = svgEl("g", {});
+  g.appendChild(svgEl("rect", { class: "map-subnet-rect", x: box.x, y: box.y, width: box.w, height: box.h, rx: 4 }));
+  g.appendChild(svgEl("text", { class: "map-subnet-label", x: box.x + 10, y: box.y + 20 }, [subnetGraphLabel(box.subnet, box.hostCells.length)]));
+  for (const cell of box.hostCells) g.appendChild(mapHostSquare(cell, originHostId));
+  return g;
+}
+
+function mapTransitGroup(box) {
+  const g = svgEl("g", {});
+  g.appendChild(svgEl("rect", { class: "map-transit-rect", x: box.x, y: box.y, width: box.w, height: box.h, rx: 6 }));
+  g.appendChild(svgEl("text", {
+    class: "map-transit-label", x: box.x + box.w / 2, y: box.y + box.h / 2, "text-anchor": "middle", "dominant-baseline": "middle",
+  }, [box.label]));
+  return g;
+}
+
+/** Human label for one edge endpoint — used by both the tooltip and (were
+ * it ever needed) debugging; kept separate from the box's own on-canvas
+ * label since a transit/origin box's label is written directly on it while
+ * this is only for the tooltip's "A → B" line. */
+function nodeRefLabel(ref) {
+  if (ref.kind === "subnet") {
+    const sn = subnetById(ref.subnetId);
+    return sn ? subnetDisplayLabel(sn) : `subnet ${ref.subnetId}`;
+  }
+  if (ref.kind === "transit") return "undocumented";
+  return "This host";
+}
+
+function edgeSummary(e) {
+  const parts = [];
+  if (e.viaIp) parts.push(`via ${e.viaIp}`);
+  parts.push(e.responded ? `hop ${e.hopIndex}` : "no response");
+  if (e.rttMs) parts.push(`${e.rttMs.toFixed(1)}ms`);
+  if (e.lossPct) parts.push(`${e.lossPct.toFixed(0)}% loss`);
+  return parts.join(" · ");
+}
+
+/** One routed edge (see routeTopologyEdges) as an orthogonal polyline with
+ * a router-icon rect at its elbow — clicking anywhere on the line or the
+ * icon opens the hop-detail tooltip. */
+function mapEdgeGroup(route) {
+  const { edge: e, points, elbow } = route;
+  const lineClass = "map-edge" + (e.responded ? "" : " map-edge-inferred");
+  const g = svgEl("g", { class: "map-router-node", onclick: (ev) => { ev.stopPropagation(); if (!mapView.dragMoved) showLinkTooltip(e, ev); } });
+  g.appendChild(svgEl("polyline", { class: lineClass, fill: "none", points: points.map((p) => `${p.x},${p.y}`).join(" ") }));
+  g.appendChild(svgEl("rect", {
+    class: "map-router-rect" + (e.responded ? "" : " map-router-rect-inferred"), x: elbow.x - 9, y: elbow.y - 9, width: 18, height: 18, rx: 3,
+  }));
+  g.appendChild(svgEl("text", { class: "map-router-label", x: elbow.x, y: elbow.y - 12, "text-anchor": "middle" }, [e.viaIp || ""]));
+  g.appendChild(svgEl("title", {}, [edgeSummary(e)]));
+  return g;
+}
+
+function hideLinkTooltip() {
+  qs("#mapLinkTooltip").hidden = true;
+}
+
+/** Positions #mapLinkTooltip near the click, relative to the map pane it's
+ * absolutely positioned within — content pans via #mapViewportGroup's
+ * transform rather than native scrolling, so the click's viewport position
+ * is already exactly where the tooltip should anchor. */
+function showLinkTooltip(e, ev) {
+  renderLinkTooltipBody(e, null);
+  const tooltip = qs("#mapLinkTooltip");
+  const rect = qs(".map-view-scroll").getBoundingClientRect();
+  tooltip.style.left = (ev.clientX - rect.left + 12) + "px";
+  tooltip.style.top = (ev.clientY - rect.top + 12) + "px";
+  tooltip.hidden = false;
+}
+
+/** Fills #mapLinkTooltip's body: the edge's endpoints and hop summary, plus
+ * either a "Run mtr…" button (mtrResult null — the initial state) or the
+ * mtr report itself once that request finishes — see Api.runTopologyMtr. */
+function renderLinkTooltipBody(e, mtrResult) {
+  const body = qs("#mapTooltipBody");
+  body.innerHTML = "";
+  body.appendChild(el("div", { class: "map-tooltip-row" }, [`${nodeRefLabel(e.a)} → ${nodeRefLabel(e.b)}`]));
+  body.appendChild(el("div", { class: "map-tooltip-row muted small" }, [edgeSummary(e)]));
+  if (mtrResult) {
+    body.appendChild(el("div", { class: "map-tooltip-row" }, [el("strong", {}, ["mtr report:"])]));
+    for (const hop of mtrResult) {
+      const detail = hop.responded ? ` · ${hop.rttMs ? hop.rttMs.toFixed(1) + "ms" : "?"} · ${(hop.lossPct || 0).toFixed(0)}% loss` : "";
+      body.appendChild(el("div", { class: "muted small" }, [`#${hop.index} ${hop.responded ? (hop.ip || "?") : "no response"}${detail}`]));
+    }
+  } else if (e.viaIp) {
+    const btn = el("button", { class: "btn btn-small" }, ["Run mtr…"]);
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      btn.textContent = "Running…";
+      try {
+        const result = await Api.runTopologyMtr(e.viaIp);
+        renderLinkTooltipBody(e, result);
+      } catch (err) {
+        toast(err.message, "bad");
+        btn.disabled = false;
+        btn.textContent = "Run mtr…";
+      }
+    });
+    body.appendChild(el("div", { class: "map-tooltip-actions" }, [btn]));
+  }
+}
+
+/** Renders the Map view: subnet boxes with host dots (via
+ * computeTopologyLayout — the same box positions the draw.io export uses),
+ * a box per undocumented transit bucket, an origin marker, and a
+ * line+router-icon for every discovered link, all inside
+ * #mapViewportGroup so wireMapPanZoom's transform moves them as one unit.
+ * Only rebuilds the SVG DOM when Map is the active view (see renderGraph)
+ * — cost is proportional to total host/edge count, not worth paying on
+ * every live update while a different view is what's actually on screen. */
+function renderMapView() {
+  const svg = qs("#mapSvg");
+  svg.innerHTML = "";
+  hideLinkTooltip();
+
+  const subnets = graphSubnets(), hosts = filteredHosts();
+  const topology = state.topology || { edges: [], transit: [] };
+  const layout = computeTopologyLayout(subnets, hosts, topology, MAP_SUBNET_ROW_Y);
+
+  qs("#mapEmptyState").hidden = topology.edges.length > 0 || subnets.length === 0;
+
+  const g = svgEl("g", { id: "mapViewportGroup" });
+  for (const box of layout.subnetLayout.boxes) g.appendChild(mapSubnetGroup(box, layout.originHostId));
+  for (const box of layout.transitBoxes) g.appendChild(mapTransitGroup(box));
+  for (const route of routeTopologyEdges(topology, layout.positions, layout.gutterX, layout.rowBands, layout.obstacles)) g.appendChild(mapEdgeGroup(route));
+  svg.appendChild(g);
+  resizeMapSvg();
+  applyMapTransform();
+}
+
+function wireMapView() {
+  qs("#mapTooltipClose").addEventListener("click", hideLinkTooltip);
+  qs("#btnMapRefresh").addEventListener("click", async () => {
+    await loadTopology(true);
+    renderMapView();
+    toast("Topology refreshed.");
+  });
+  wireMapPanZoom();
+  const ZOOM_STEP = 1.4;
+  qs("#btnMapZoomIn").addEventListener("click", () => mapZoomBy(ZOOM_STEP));
+  qs("#btnMapZoomOut").addEventListener("click", () => mapZoomBy(1 / ZOOM_STEP));
+  qs("#btnMapZoomReset").addEventListener("click", () => mapResetZoom());
+}
+
 function renderTagSelects() {
   const modalSelect = qs("#hamSubnet");
   modalSelect.innerHTML = "";
@@ -1123,6 +1441,7 @@ function renderGraph() {
   const subnets = graphSubnets(), hosts = filteredHosts();
   if (graph) graph.sync(subnets, hosts);
   renderTableView();
+  if (state.viewMode === "map" && state.topology) renderMapView();
 }
 
 function renderAll() {
@@ -1149,8 +1468,14 @@ function openHostModal(hostId) {
   if (!h) return;
   qs("#hmIP").textContent = h.ip;
 
+  const isRouter = inferHostKind(h) === "router";
   const callouts = qs("#hmCallouts");
   callouts.innerHTML = "";
+  if (isRouter) {
+    callouts.appendChild(el("div", { class: "hm-callout hm-callout-info" }, [
+      "🌐 Identified as a router/gateway — inferred from its address/hostname, not confirmed.",
+    ]));
+  }
   if (h.suspect) {
     callouts.appendChild(el("div", { class: "hm-callout hm-callout-suspect" }, [
       "⚠ Likely not a real host: ", h.suspectReason,
@@ -1283,6 +1608,39 @@ function openHostModal(hostId) {
       toast(err.message, "bad");
     }
   };
+
+  // Only shown for a host inferHostKind identified as a router/gateway —
+  // an on-demand mtr report is only interesting for the device the
+  // scanner's actually routing traffic through, not every host. Reuses
+  // the same endpoint the Map view's router-link tooltip's "Run mtr…"
+  // button calls (see Api.runTopologyMtr) — this is just that action
+  // reachable from the host itself, not tied to a specific traced link.
+  const mtrSection = qs("#hmMtrSection");
+  mtrSection.hidden = !isRouter;
+  if (isRouter) {
+    const mtrBtn = qs("#hmRunMtr");
+    const mtrResult = qs("#hmMtrResult");
+    mtrResult.innerHTML = "";
+    mtrBtn.disabled = false;
+    mtrBtn.textContent = "Run mtr…";
+    mtrBtn.onclick = async () => {
+      mtrBtn.disabled = true;
+      mtrBtn.textContent = "Running…";
+      try {
+        const hops = await Api.runTopologyMtr(h.ip);
+        mtrResult.innerHTML = "";
+        for (const hop of hops) {
+          const detail = hop.responded ? ` · ${hop.rttMs ? hop.rttMs.toFixed(1) + "ms" : "?"} · ${(hop.lossPct || 0).toFixed(0)}% loss` : "";
+          mtrResult.appendChild(el("div", { class: "muted small" }, [`#${hop.index} ${hop.responded ? (hop.ip || "?") : "no response"}${detail}`]));
+        }
+      } catch (err) {
+        toast(err.message, "bad");
+      } finally {
+        mtrBtn.disabled = false;
+        mtrBtn.textContent = "Run mtr…";
+      }
+    };
+  }
 
   qs("#hmSave").onclick = async () => {
     // hostname/mac are only sent when actually edited, not on every save —
@@ -1444,6 +1802,17 @@ async function refreshRiskRulesAndSettings() {
 
 const refreshDebounced = debounce(refreshHostsAndSubnets, 350);
 
+/** Reloads topology data in the background on every topology_updated SSE
+ * event (see connectSSE) and re-renders the Map view if it's the active
+ * one — the same "live data, refreshed view only if it's on screen"
+ * pattern renderGraph already applies to Map view for host/subnet changes.
+ * Debounced since the automatic topology ticker can emit one event per
+ * subnet in a short burst. */
+const refreshTopologyDebounced = debounce(async () => {
+  await loadTopology(true);
+  if (state.viewMode === "map") renderMapView();
+}, 350);
+
 /* ---------------------------------------------------------------------- */
 /* SSE                                                                    */
 /* ---------------------------------------------------------------------- */
@@ -1486,6 +1855,18 @@ function connectSSE() {
       }
     });
   }
+
+  // topology_updated is its own listener rather than folded into evTypes
+  // above: it doesn't touch hosts/subnets (refreshDebounced would be a
+  // no-op for it) and firing per subnet as the automatic topology ticker
+  // works through each one would otherwise queue a burst of individually-
+  // debounced refetches — refreshTopologyDebounced coalesces those into
+  // one.
+  sse.addEventListener("topology_updated", (e) => {
+    const ev = JSON.parse(e.data);
+    receiveNotification(ev);
+    refreshTopologyDebounced();
+  });
 
   sse.onerror = () => {
     connLabel.textContent = "reconnecting…";
@@ -1733,17 +2114,18 @@ function wireGraphControls() {
   });
 }
 
-const VIEW_LABELS = { graph: "Graph", table: "Table" };
+const VIEW_LABELS = { graph: "Graph", table: "Table", map: "Map" };
 
 /** Applies state.viewMode to the layout and to whether the graph is
  * actively rendering. Pausing it (rather than just hiding it with CSS) is
- * the point in table view: the canvas stops doing any per-frame work
+ * the point in table/map view: the canvas stops doing any per-frame work
  * outright, instead of continuing to repaint an element the user can't
  * see. */
 function applyViewMode() {
   const mode = state.viewMode;
   const layout = qs("#layout");
   layout.classList.toggle("table-view", mode === "table");
+  layout.classList.toggle("map-view", mode === "map");
 
   qs("#btnViewMenuToggle").textContent = `View: ${VIEW_LABELS[mode]} ▾`;
   for (const btn of qsa("#viewMenu .account-menu-item")) {
@@ -1751,18 +2133,19 @@ function applyViewMode() {
   }
 
   if (graph) {
-    if (mode === "table") {
-      graph.setPaused(true);
-    } else {
+    if (mode === "graph") {
       // Its canvas was display:none while hidden, so its rect (and
       // anything sized from it) may be stale or zero; recompute before
       // unpausing so switching to it doesn't briefly draw into a
       // zero-sized canvas.
       graph._resize();
       graph.setPaused(false);
+    } else {
+      graph.setPaused(true);
     }
   }
   if (mode === "table") renderTableView();
+  if (mode === "map") loadTopology().then(renderMapView);
 }
 
 function wireViewToggle() {
@@ -1787,10 +2170,10 @@ function wireViewToggle() {
 }
 
 /** The graph, when it's the visible view — what the +/- zoom buttons and
- * any other view-agnostic graph control should act on. null in table
+ * any other view-agnostic graph control should act on. null in table/map
  * view, where the canvas isn't shown. */
 function activeGraph() {
-  return state.viewMode === "table" ? null : graph;
+  return state.viewMode === "graph" ? graph : null;
 }
 
 /** +/- zoom buttons: an explicit, clickable alternative to scroll-to-zoom
@@ -2059,6 +2442,436 @@ function gridRows(items, cols) {
   return rows;
 }
 
+/* ---------------------------------------------------------------------- */
+/* shared subnet-box layout — the "subnets side by side, hosts in a       */
+/* roughly-square grid inside" arrangement both the Map view (SVG) and    */
+/* the draw.io export draw, computed once here so they never drift apart. */
+/* ---------------------------------------------------------------------- */
+
+const LAYOUT = {
+  ICON_W: 60, ICON_H: 44, LABEL_H: 30, CELL_W: 150, CELL_GAP_X: 20, CELL_GAP_Y: 15,
+  PAD: 20, TITLE_H: 30, SUBNET_GAP_X: 40, SUBNET_GAP_Y: 40,
+};
+LAYOUT.CELL_H = LAYOUT.ICON_H + LAYOUT.LABEL_H;
+
+/** Lays out items left-to-right, wrapping to a new row once a row's width
+ * would exceed a target derived from gridColumns(items.length) — the same
+ * "roughly square" sqrt-based rule the host icon grid inside a subnet box
+ * already follows, just one level up. Sharing this between subnet boxes and
+ * transit-bucket boxes (see computeSubnetLayout/computeTopologyLayout) is
+ * what keeps the overall Map/draw.io layout from becoming one long
+ * horizontal strip as subnet or transit-bucket count grows.
+ *
+ * sizer(item) returns that item's natural {w, h}; a row's height is its
+ * tallest item, so rows can differ in height without misaligning columns
+ * (this isn't a strict table grid — a big item just makes its own row
+ * taller, not every row). */
+function flowLayoutSquare(items, sizer, startX, startY, gapX, gapY) {
+  if (items.length === 0) return { positioned: [], totalWidth: 0, totalHeight: 0 };
+  const sized = items.map((item) => ({ item, ...sizer(item) }));
+  const rowCount = gridColumns(sized.length);
+  const naturalWidth = sized.reduce((sum, s) => sum + s.w, 0) + gapX * (sized.length - 1);
+  const targetRowWidth = Math.max(...sized.map((s) => s.w), naturalWidth / rowCount);
+
+  const positioned = [];
+  let x = startX, y = startY, rowMaxH = 0, rowStart = true;
+  for (const s of sized) {
+    if (!rowStart && x + s.w > startX + targetRowWidth) {
+      x = startX;
+      y += rowMaxH + gapY;
+      rowMaxH = 0;
+      rowStart = true;
+    }
+    positioned.push({ item: s.item, x, y, w: s.w, h: s.h });
+    x += s.w + gapX;
+    rowMaxH = Math.max(rowMaxH, s.h);
+    rowStart = false;
+  }
+  return {
+    positioned,
+    totalWidth: Math.max(...positioned.map((p) => p.x + p.w)) - startX,
+    totalHeight: (y - startY) + rowMaxH,
+  };
+}
+
+/** Lays out subnets in a roughly-square flow grid (see flowLayoutSquare)
+ * starting at (LAYOUT.PAD, startY), each box sized to fit its hosts in a
+ * roughly-square icon grid of its own (see gridColumns). Returns one box
+ * per subnet — {subnet, x, y, w, h, hostCells: [{host, x, y, w, h}, ...]}
+ * — plus the total width/height consumed, so a caller can place whatever
+ * comes next (a ports table, a transit-bucket block, ...) below without
+ * recomputing any of this math itself.
+ *
+ * hostCells positions the top-left corner of the icon within its CELL_W-
+ * wide column (icons are narrower than a column so labels below them have
+ * room to breathe) — draw.io's export additionally centers the icon in the
+ * cell; the Map view draws it as-is.
+ *
+ * startX defaults to LAYOUT.PAD but can be pushed right — see
+ * computeTopologyLayout, which reserves a left gutter column for the trace
+ * origin and its trunk line when topology data references it. */
+function computeSubnetLayout(subnets, hosts, startY, startX = LAYOUT.PAD) {
+  const { ICON_W, ICON_H, CELL_W, CELL_GAP_X, CELL_GAP_Y, CELL_H, PAD, TITLE_H, SUBNET_GAP_X, SUBNET_GAP_Y } = LAYOUT;
+  const bySubnet = new Map();
+  for (const h of hosts) {
+    if (!bySubnet.has(h.subnetId)) bySubnet.set(h.subnetId, []);
+    bySubnet.get(h.subnetId).push(h);
+  }
+
+  const sizer = (sn) => {
+    const snHosts = (bySubnet.get(sn.id) || []).slice().sort((a, b) => a.ip.localeCompare(b.ip, undefined, { numeric: true }));
+    const cols = gridColumns(snHosts.length || 1);
+    const rows = Math.max(Math.ceil(snHosts.length / cols), 1);
+    return {
+      snHosts, cols,
+      w: cols * CELL_W + (cols - 1) * CELL_GAP_X + PAD * 2,
+      h: TITLE_H + PAD + rows * CELL_H + (rows - 1) * CELL_GAP_Y + PAD,
+    };
+  };
+  const flow = flowLayoutSquare(subnets, sizer, startX, startY, SUBNET_GAP_X, SUBNET_GAP_Y);
+
+  const boxes = flow.positioned.map(({ item: sn, x, y, w, h }) => {
+    const { snHosts, cols } = sizer(sn);
+    const hostCells = snHosts.map((host, i) => {
+      const col = i % cols, row = Math.floor(i / cols);
+      return {
+        host,
+        x: x + PAD + col * (CELL_W + CELL_GAP_X) + (CELL_W - ICON_W) / 2,
+        y: y + TITLE_H + PAD + row * (CELL_H + CELL_GAP_Y),
+        w: ICON_W, h: ICON_H,
+      };
+    });
+    return { subnet: sn, x, y, w, h, hostCells };
+  });
+  return { boxes, totalWidth: flow.totalWidth, totalHeight: flow.totalHeight };
+}
+
+function nodeRefKey(ref) {
+  if (ref.kind === "subnet") return "subnet:" + ref.subnetId;
+  if (ref.kind === "transit") return "transit:" + ref.transitKey;
+  return "origin";
+}
+
+/** Label for a transit-bucket node — the /24 draw.io/Map view infer it
+ * belongs to (see discovery.BuildTopologyGraph server-side; a hop that
+ * never answered carries no such information and is disregarded entirely
+ * rather than becoming a bucket — see classifySegment). The !bucket
+ * fallback is defensive only: every key computeTopologyLayout lays out
+ * should always resolve to a real bucket from the server. */
+function transitNodeLabel(bucket) {
+  if (!bucket) return "undocumented";
+  return bucket.cidr + (bucket.ips && bucket.ips.length > 1 ? ` (${bucket.ips.length} IPs)` : "");
+}
+
+/** BFS distance (in edges) from the trace origin to every other node a
+ * topology graph's edges reference — used to order transit buckets roughly
+ * along the direction traffic actually flows (see computeTopologyLayout)
+ * instead of arbitrary edge-list order, which otherwise produces a lot of
+ * needless left-right zigzag once links are drawn. Falls back to treating
+ * any node BFS never reaches from "origin" (shouldn't normally happen —
+ * every traced path starts there) as its own depth-0 root so it still gets
+ * a defined position. */
+function computeNodeDepths(edges) {
+  const adj = new Map();
+  const addEdge = (k1, k2) => {
+    if (!adj.has(k1)) adj.set(k1, []);
+    if (!adj.has(k2)) adj.set(k2, []);
+    adj.get(k1).push(k2);
+    adj.get(k2).push(k1);
+  };
+  for (const e of edges) addEdge(nodeRefKey(e.a), nodeRefKey(e.b));
+
+  const depth = new Map();
+  const roots = adj.has("origin") ? ["origin"] : Array.from(adj.keys());
+  for (const root of roots) {
+    if (depth.has(root)) continue;
+    depth.set(root, 0);
+    const queue = [root];
+    for (let qi = 0; qi < queue.length; qi++) {
+      const cur = queue[qi];
+      for (const nb of adj.get(cur)) {
+        if (!depth.has(nb)) { depth.set(nb, depth.get(cur) + 1); queue.push(nb); }
+      }
+    }
+  }
+  return depth;
+}
+
+// MARGIN_GUTTER_W is a slim reserved lane to the left of the whole
+// subnet/transit grid — not home to any node anymore (there's no more
+// separate "this host" box; see computeTopologyLayout), just a guaranteed-
+// empty fallback corridor marginRoute can detour an edge through when a
+// direct line between its two boxes would otherwise cut across whatever
+// happens to sit geometrically between them.
+const MARGIN_GUTTER_W = 50;
+
+/** Places every node a topology graph's edges can reference: subnet boxes
+ * (via computeSubnetLayout, so router links always line up with the same
+ * boxes the plain subnet/host grid draws) and undocumented transit
+ * buckets — only the ones actually referenced by an edge, flowed into a
+ * roughly-square block (see flowLayoutSquare) beneath the subnets, left-to-
+ * right in BFS hop order from the origin (see computeNodeDepths) so a
+ * chain of hops reads in the direction traffic actually flows instead of
+ * an arbitrary order.
+ *
+ * The trace origin ("this host") has no node of its own to place: instead,
+ * originIps (from GET /api/topology, this app's own local addresses) is
+ * matched against every host cell already laid out, and that host's own
+ * subnet box stands in for "origin" wherever an edge references it —
+ * exactly like any other subnet-to-X edge, since that's genuinely where
+ * the trace started. originHostId (the matched host's id, for
+ * highlighting it in place — see mapHostSquare) is null when none of this
+ * app's own addresses match a discovered host yet, in which case any edge
+ * touching origin is simply skipped when routing (see routeTopologyEdges)
+ * rather than falling back to a synthetic placeholder node.
+ *
+ * Shared by the Map view and the draw.io export so a link's endpoints land
+ * in the same place in both. */
+function computeTopologyLayout(subnets, hosts, topology, subnetRowY) {
+  const edges = (topology && topology.edges) || [];
+  const gridStartX = LAYOUT.PAD + MARGIN_GUTTER_W;
+  const gutterX = LAYOUT.PAD + MARGIN_GUTTER_W / 2;
+
+  const subnetLayout = computeSubnetLayout(subnets, hosts, subnetRowY, gridStartX);
+  const positions = new Map();
+  for (const box of subnetLayout.boxes) positions.set("subnet:" + box.subnet.id, box);
+
+  let originHostId = null;
+  const originIps = new Set((topology && topology.originIps) || []);
+  if (originIps.size) {
+    outer: for (const box of subnetLayout.boxes) {
+      for (const cell of box.hostCells) {
+        if (originIps.has(cell.host.ip)) {
+          originHostId = cell.host.id;
+          positions.set("origin", box);
+          break outer;
+        }
+      }
+    }
+  }
+
+  const usedTransitKeys = [];
+  const seenTransitKeys = new Set();
+  for (const e of edges) {
+    for (const ref of [e.a, e.b]) {
+      if (ref.kind === "transit" && !seenTransitKeys.has(ref.transitKey)) {
+        seenTransitKeys.add(ref.transitKey);
+        usedTransitKeys.push(ref.transitKey);
+      }
+    }
+  }
+  const depths = computeNodeDepths(edges);
+  usedTransitKeys.sort((k1, k2) => {
+    const d1 = depths.get("transit:" + k1) ?? Infinity, d2 = depths.get("transit:" + k2) ?? Infinity;
+    return d1 - d2 || k1.localeCompare(k2);
+  });
+
+  const bucketByKey = new Map(((topology && topology.transit) || []).map((b) => [b.key, b]));
+  const TRANSIT_W = 170, TRANSIT_H = 60;
+  const transitY = subnetRowY + subnetLayout.totalHeight + 50;
+  const transitFlow = flowLayoutSquare(
+    usedTransitKeys, () => ({ w: TRANSIT_W, h: TRANSIT_H }), gridStartX, transitY, 20, LAYOUT.SUBNET_GAP_Y,
+  );
+  const transitBoxes = transitFlow.positioned.map(({ item: key, x, y, w, h }) => {
+    const bucket = bucketByKey.get(key);
+    const box = { key, bucket, x, y, w, h, label: transitNodeLabel(bucket) };
+    positions.set("transit:" + key, box);
+    return box;
+  });
+
+  const obstacles = [...subnetLayout.boxes, ...transitBoxes];
+  const rowBands = computeRowBands(obstacles);
+
+  // Both totalWidth and totalHeight are absolute — the rightmost edge and
+  // bottom-most edge of everything laid out here — since callers (the
+  // ports table's y-position in buildDrawioDiagram, the SVG's size in
+  // renderMapView) place things directly below/around this block rather
+  // than needing a relative size to reposition themselves with.
+  const totalWidth = Math.max(gridStartX + subnetLayout.totalWidth, gridStartX + transitFlow.totalWidth) + LAYOUT.PAD;
+  const totalHeight = usedTransitKeys.length ? transitY + transitFlow.totalHeight : subnetRowY + subnetLayout.totalHeight;
+  return { subnetLayout, transitBoxes, positions, totalWidth, totalHeight, gutterX, rowBands, obstacles, originHostId };
+}
+
+/** Every box's row's shared vertical extent, keyed by the row's own y (flow
+ * LayoutSquare gives every item in a row that same y) — the top/bottom of
+ * the row's *tallest* member, not just this one box's own height. Used by
+ * marginRoute to pick an exit point that clears every box in a row, not
+ * just the one an edge happens to start/end at: a shorter box's own bottom
+ * edge can sit well above a taller neighbor's, so a different row's box
+ * sharing that x-range could still be in the way otherwise. */
+function computeRowBands(boxes) {
+  const bands = new Map();
+  for (const b of boxes) {
+    const bottom = b.y + b.h;
+    const existing = bands.get(b.y);
+    if (!existing) bands.set(b.y, { top: b.y, bottom });
+    else existing.bottom = Math.max(existing.bottom, bottom);
+  }
+  return bands;
+}
+
+/** Routes one edge as a 3-segment orthogonal (elbow) polyline between two
+ * layout boxes — axis-aligned exit/entry points on whichever side of each
+ * box faces the other (so it enters at the other box's own center, a
+ * straight line if they're already aligned or a single clean L-bend if
+ * not), rather than always detouring through a shared margin regardless of
+ * whether that's actually necessary. This is what most edges use; only
+ * ones a direct line would cut through some other box for fall back to
+ * marginRoute (see routeEdge). Returns the route's points plus a stable
+ * "elbow" point (the middle segment's midpoint) to anchor the router
+ * glyph. */
+function orthogonalRoute(a, b) {
+  const aC = { x: a.x + a.w / 2, y: a.y + a.h / 2 }, bC = { x: b.x + b.w / 2, y: b.y + b.h / 2 };
+  const dx = bC.x - aC.x, dy = bC.y - aC.y;
+  let points;
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    const exitX = dx >= 0 ? a.x + a.w : a.x, entryX = dx >= 0 ? b.x : b.x + b.w;
+    const midX = (exitX + entryX) / 2;
+    points = [{ x: exitX, y: aC.y }, { x: midX, y: aC.y }, { x: midX, y: bC.y }, { x: entryX, y: bC.y }];
+  } else {
+    const exitY = dy >= 0 ? a.y + a.h : a.y, entryY = dy >= 0 ? b.y : b.y + b.h;
+    const midY = (exitY + entryY) / 2;
+    points = [{ x: aC.x, y: exitY }, { x: aC.x, y: midY }, { x: bC.x, y: midY }, { x: bC.x, y: entryY }];
+  }
+  return { points, elbow: { x: (points[1].x + points[2].x) / 2, y: (points[1].y + points[2].y) / 2 } };
+}
+
+/** Routes an edge by escaping each endpoint to its own row's shared
+ * vertical extent (see computeRowBands — a horizontal "street" clear for
+ * the full width of the grid, by construction, since it's the gap between
+ * rows) facing the other endpoint, then along the shared left margin (see
+ * MARGIN_GUTTER_W — reserved, empty column to the left of every row) to
+ * the other endpoint's row street, then in. Guaranteed collision-free
+ * regardless of how many rows or columns apart the two boxes are — see
+ * routeEdge, which only falls back to this when a direct orthogonalRoute
+ * would actually cut through something. */
+function marginRoute(a, b, gutterX, rowBands) {
+  const aBand = rowBands.get(a.y) || { top: a.y, bottom: a.y + a.h };
+  const bBand = rowBands.get(b.y) || { top: b.y, bottom: b.y + b.h };
+  const sameRow = a.y === b.y;
+  const aBelowB = a.y > b.y;
+
+  const exitY = sameRow || !aBelowB ? aBand.bottom : aBand.top; // exit toward B's side of this row
+  const entryY = sameRow || !aBelowB ? bBand.bottom : bBand.top;
+  const points = [
+    { x: a.x + a.w / 2, y: exitY }, { x: gutterX, y: exitY },
+    { x: gutterX, y: entryY }, { x: b.x + b.w / 2, y: entryY },
+  ];
+
+  // Collapse consecutive duplicate points (both endpoints exiting to the
+  // exact same street y — e.g. two boxes in the same row — degenerates
+  // the detour into a single straight line along that street, which is
+  // already collision-free on its own, no gutter trip needed).
+  const dedup = points.filter((p, i) => i === 0 || p.x !== points[i - 1].x || p.y !== points[i - 1].y);
+  const gutterYs = dedup.filter((p) => p.x === gutterX).map((p) => p.y);
+  const elbow = gutterYs.length
+    ? { x: gutterX, y: (Math.min(...gutterYs) + Math.max(...gutterYs)) / 2 }
+    : { x: (dedup[0].x + dedup[dedup.length - 1].x) / 2, y: dedup[0].y };
+  return { points: dedup, elbow };
+}
+
+/** Whether an axis-aligned segment (p1-p2 — always either perfectly
+ * horizontal or vertical, which is all orthogonalRoute/marginRoute ever
+ * produce) passes through box's interior, shrunk slightly (pad) so merely
+ * touching a box's own border — exactly what happens at a route's own
+ * start/end box — never counts as a collision. */
+function segIntersectsBox(p1, p2, box, pad) {
+  const rx0 = box.x + pad, ry0 = box.y + pad, rx1 = box.x + box.w - pad, ry1 = box.y + box.h - pad;
+  if (Math.abs(p1.x - p2.x) < 0.01) {
+    const x = p1.x;
+    if (x > rx0 && x < rx1) {
+      const lo = Math.min(p1.y, p2.y), hi = Math.max(p1.y, p2.y);
+      if (hi > ry0 && lo < ry1) return true;
+    }
+  } else if (Math.abs(p1.y - p2.y) < 0.01) {
+    const y = p1.y;
+    if (y > ry0 && y < ry1) {
+      const lo = Math.min(p1.x, p2.x), hi = Math.max(p1.x, p2.x);
+      if (hi > rx0 && lo < rx1) return true;
+    }
+  }
+  return false;
+}
+
+function routeIsClear(points, obstacles) {
+  for (let i = 0; i < points.length - 1; i++) {
+    for (const box of obstacles) {
+      if (segIntersectsBox(points[i], points[i + 1], box, 2)) return false;
+    }
+  }
+  return true;
+}
+
+/** Routes one edge: a direct orthogonalRoute (straight line, or a single
+ * clean L-bend) when that path doesn't cut through any other box on the
+ * layout, otherwise the guaranteed-safe marginRoute detour. Trying the
+ * direct route first is what keeps the common case — most links, since
+ * subnets and transit buckets are each their own tidy band — reading as a
+ * normal straight/L connector into the middle of the target, instead of
+ * every single edge detouring through the margin regardless of whether it
+ * actually needs to. */
+function routeEdge(a, b, gutterX, rowBands, obstacles) {
+  const direct = orthogonalRoute(a, b);
+  if (routeIsClear(direct.points, obstacles)) return direct;
+  return marginRoute(a, b, gutterX, rowBands);
+}
+
+/** Routes every edge in a topology graph (see routeEdge), and fans out
+ * edges that share the same pair of endpoints — two different routers both
+ * observed connecting the same two nodes, say — so they don't literally
+ * draw on top of each other: the 2nd+ edge in a group gets nudged
+ * perpendicular to the route's own direction by an increasing offset.
+ * Shared by the Map view and the draw.io export so both draw exactly the
+ * same lines. Skips any edge whose endpoint isn't in positions — either it
+ * references a transit bucket that somehow wasn't laid out (shouldn't
+ * normally happen), or it touches the trace origin and no discovered host
+ * matched this app's own address (see computeTopologyLayout) — and any
+ * edge that resolves to the exact same box at both ends (the origin's own
+ * subnet referencing itself). */
+function routeTopologyEdges(topology, positions, gutterX, rowBands, obstacles) {
+  const groups = new Map();
+  for (const e of (topology && topology.edges) || []) {
+    const aKey = nodeRefKey(e.a), bKey = nodeRefKey(e.b);
+    const a = positions.get(aKey), b = positions.get(bKey);
+    if (!a || !b || a === b) continue;
+    const pairKey = aKey < bKey ? aKey + "|" + bKey : bKey + "|" + aKey;
+    if (!groups.has(pairKey)) groups.set(pairKey, []);
+    groups.get(pairKey).push({ e, a, b });
+  }
+
+  const routes = [];
+  for (const group of groups.values()) {
+    group.forEach(({ e, a, b }, i) => {
+      const route = routeEdge(a, b, gutterX, rowBands || new Map(), obstacles || []);
+      // Fan out the 2nd+ edge sharing this same endpoint pair by nudging
+      // the two interior (bend) points sideways by an increasing offset —
+      // whichever axis those two points already share (x for a vertical
+      // connecting segment, y for a horizontal one) is the one that moves,
+      // since that's what keeps every segment touching them still exactly
+      // axis-aligned afterward: their shared coordinate just becomes a
+      // different value, and each one's *other* coordinate — the one it
+      // shares with its own neighbor endpoint instead — is untouched.
+      // Skipped for a 1-point (or shorter) interior: a duplicate pair
+      // landing on that exact, rarer shape just overlaps rather than risk
+      // turning a straight line into a diagonal one.
+      if (i > 0) {
+        const offset = Math.ceil(i / 2) * 22 * (i % 2 === 0 ? -1 : 1);
+        const interior = route.points.slice(1, -1);
+        if (interior.length >= 2) {
+          const first = interior[0], last = interior[interior.length - 1];
+          const sharedX = Math.abs(first.x - last.x) < 0.01;
+          for (const p of interior) {
+            if (sharedX) p.x += offset; else p.y += offset;
+          }
+          route.elbow = { x: (first.x + last.x) / 2, y: (first.y + last.y) / 2 };
+        }
+      }
+      routes.push({ edge: e, ...route });
+    });
+  }
+  return routes;
+}
+
 /** One host node's label: IP, then hostname (via <br/>) when present,
  * prefixed with a warning marker for an unacknowledged priority host — the
  * same "priority" definition priorityReportHosts uses. Ports are
@@ -2285,32 +3098,52 @@ function inferHostKind(h) {
   return hasServerPort ? "server" : "workstation";
 }
 
-/** Builds a single native draw.io (.drawio) file: a status legend and an
- * icon-key legend, subnets as labeled boxes with hosts arranged in a
- * roughly-square grid inside (see gridColumns/gridRows — same layout
- * buildMermaidDiagram produces), each host drawn as a router/server/
- * workstation icon (see inferHostKind) tinted by status, and a table node
- * listing every host's open ports. Unlike the Mermaid export, draw.io
- * opens this directly with no import step — so layout is computed here
- * with a fixed grid rather than relying on draw.io's own Mermaid-import
- * layout engine. */
-function buildDrawioDiagram(subnets, hosts) {
-  const bySubnet = new Map();
-  for (const h of hosts) {
-    if (!bySubnet.has(h.subnetId)) bySubnet.set(h.subnetId, []);
-    bySubnet.get(h.subnetId).push(h);
+const CONTAINER_STYLE = "rounded=0;whiteSpace=wrap;html=1;verticalAlign=top;fillColor=#f5f5f5;strokeColor=#666666;fontStyle=1;fontSize=14;";
+const TRANSIT_CONTAINER_STYLE = "rounded=0;whiteSpace=wrap;html=1;verticalAlign=middle;dashed=1;fillColor=#f5f5f5;strokeColor=#999999;fontColor=#666666;fontStyle=2;fontSize=12;";
+const drawioIconStyle = (shape, fill, stroke, font) =>
+  `shape=${shape};html=1;fillColor=${fill};strokeColor=${stroke};fontColor=${font};` +
+  "verticalLabelPosition=bottom;verticalAlign=top;align=center;fontSize=11;outlineConnect=0;";
+
+/** Draws every router link a topology graph has an edge for onto an
+ * already-built draw.io node set: a small router icon at each routed
+ * edge's elbow (see routeTopologyEdges — the same orthogonal routes, offset
+ * apart when several edges share the same two endpoints, that the Map view
+ * draws) and a geometry-only orthogonal edge with explicit waypoints
+ * connecting through it — solid when the hop that identified the crossing
+ * actually responded, dashed when it's inferred (see
+ * discovery.BuildTopologyGraph server-side). Shared by buildDrawioDiagram;
+ * addNode/idCounter are the caller's, threaded through as closures via the
+ * addNode/addEdgePath params so this stays a plain function instead of a
+ * method on some larger builder object. */
+function addTopologyLinksToDrawio(topologyLayout, addNode, addEdgePath) {
+  for (const box of topologyLayout.transitBoxes) {
+    addNode(box.label, TRANSIT_CONTAINER_STYLE, box.x, box.y, box.w, box.h);
   }
 
-  // 60x44 is a compromise box: close to "PC"/"Mail Server"'s native aspect
-  // (100x70, 103x107) without either dominating; "Router" (100x29) still
-  // renders a bit taller than its native aspect, but recognizable.
-  const ICON_W = 60, ICON_H = 44, LABEL_H = 30, CELL_W = 150, CELL_GAP_X = 20, CELL_GAP_Y = 15;
-  const CELL_H = ICON_H + LABEL_H;
-  const PAD = 20, TITLE_H = 30, SUBNET_GAP_X = 40;
-  const CONTAINER_STYLE = "rounded=0;whiteSpace=wrap;html=1;verticalAlign=top;fillColor=#f5f5f5;strokeColor=#666666;fontStyle=1;fontSize=14;";
-  const iconStyle = (shape, fill, stroke, font) =>
-    `shape=${shape};html=1;fillColor=${fill};strokeColor=${stroke};fontColor=${font};` +
-    "verticalLabelPosition=bottom;verticalAlign=top;align=center;fontSize=11;outlineConnect=0;";
+  for (const route of routeTopologyEdges(topologyLayout.topology, topologyLayout.positions, topologyLayout.gutterX, topologyLayout.rowBands, topologyLayout.obstacles)) {
+    const { edge: e, points, elbow } = route;
+    const edgeStyle = `endArrow=none;html=1;rounded=0;strokeColor=${e.responded ? "#666666" : "#b85450"};` + (e.responded ? "" : "dashed=1;");
+    addEdgePath(points, edgeStyle);
+    addNode(
+      e.viaIp || "?", drawioIconStyle(HOST_KIND_SHAPE.router, "#dae8fc", e.responded ? "#6c8ebf" : "#b85450", "#333333"),
+      elbow.x - LAYOUT.ICON_W / 2, elbow.y - LAYOUT.ICON_H / 2, LAYOUT.ICON_W, LAYOUT.ICON_H,
+    );
+  }
+}
+
+/** Builds a single native draw.io (.drawio) file: a status legend and an
+ * icon-key legend, subnets as labeled boxes with hosts arranged in a
+ * roughly-square grid inside (see computeSubnetLayout), each host drawn as
+ * a router/server/workstation icon (see inferHostKind) tinted by status,
+ * router links between subnets when topology data is available (see
+ * computeTopologyLayout/addTopologyLinksToDrawio), and a table node listing
+ * every host's open ports. Unlike the Mermaid export, draw.io opens this
+ * directly with no import step — so layout is computed here with a fixed
+ * grid rather than relying on draw.io's own Mermaid-import layout engine.
+ * topology is optional — when omitted (no topology scan has run yet) the
+ * output is exactly the plain subnet/host grid this always drew. */
+function buildDrawioDiagram(subnets, hosts, topology) {
+  const { ICON_W, ICON_H, LABEL_H, PAD, TITLE_H } = LAYOUT;
 
   let idCounter = 2;
   const cells = [];
@@ -2322,8 +3155,26 @@ function buildDrawioDiagram(subnets, hosts) {
     );
     return id;
   };
+  // Geometry-only edge (no source/target cell references) with explicit
+  // waypoints — draws exactly the orthogonal route routeTopologyEdges
+  // computed, pixel-for-pixel the same as the Map view, rather than
+  // relying on draw.io's own edge routing between two anchor cells.
+  const addEdgePath = (points, style) => {
+    const id = `n${idCounter++}`;
+    const first = points[0], last = points[points.length - 1];
+    const waypoints = points.slice(1, -1).map((p) => `<mxPoint x="${p.x}" y="${p.y}" as="point"/>`).join("");
+    cells.push(
+      `        <mxCell id="${id}" style="${drawioAttr(style)}" edge="1" parent="1">` +
+        `<mxGeometry relative="1" as="geometry">` +
+        `<mxPoint x="${first.x}" y="${first.y}" as="sourcePoint"/>` +
+        `<mxPoint x="${last.x}" y="${last.y}" as="targetPoint"/>` +
+        (waypoints ? `<Array as="points">${waypoints}</Array>` : "") +
+        `</mxGeometry></mxCell>`,
+    );
+  };
 
-  // ---- Legends: status color, and icon-shape key ----
+  // ---- Legends: status color, icon-shape key, and (when there's topology
+  // data) link-confidence key ----
   const LEGEND_W = 380, SWATCH_H = 40, SWATCH_GAP = 10;
   const legendEntries = [
     ["statusUp", "Up — confirmed live"],
@@ -2350,49 +3201,65 @@ function buildDrawioDiagram(subnets, hosts) {
   kindEntries.forEach(([kind, label], i) => {
     addNode(
       label,
-      iconStyle(HOST_KIND_SHAPE[kind], "#dae8fc", "#6c8ebf", "#333333"),
+      drawioIconStyle(HOST_KIND_SHAPE[kind], "#dae8fc", "#6c8ebf", "#333333"),
       kindLegendX + PAD + i * kindLegendCellW + (kindLegendCellW - ICON_W) / 2, PAD + TITLE_H + PAD, ICON_W, ICON_H,
     );
   });
 
-  // ---- Subnets: left-to-right, hosts in a roughly-square grid within each ----
-  const subnetRowY = PAD + Math.max(legendH, kindLegendH) + 40;
-  let x = PAD;
-  let maxSubnetH = 0;
-  for (const sn of subnets) {
-    const snHosts = (bySubnet.get(sn.id) || []).slice().sort((a, b) => a.ip.localeCompare(b.ip, undefined, { numeric: true }));
-    const cols = gridColumns(snHosts.length || 1);
-    const rows = Math.max(Math.ceil(snHosts.length / cols), 1);
-    const subnetW = cols * CELL_W + (cols - 1) * CELL_GAP_X + PAD * 2;
-    const subnetH = TITLE_H + PAD + rows * CELL_H + (rows - 1) * CELL_GAP_Y + PAD;
-    maxSubnetH = Math.max(maxSubnetH, subnetH);
-    addNode(subnetDisplayLabel(sn), CONTAINER_STYLE, x, subnetRowY, subnetW, subnetH);
-    if (snHosts.length === 0) {
+  const hasTopology = topology && topology.edges && topology.edges.length > 0;
+  let linkLegendH = 0;
+  if (hasTopology) {
+    const linkLegendX = kindLegendX + kindLegendW + 40;
+    const linkLegendW = 260;
+    const linkEntries = [
+      ["#666666", false, "Confirmed hop"],
+      ["#b85450", true, "Inferred / no response"],
+    ];
+    linkLegendH = TITLE_H + PAD + linkEntries.length * 24 + PAD;
+    addNode("Links", CONTAINER_STYLE, linkLegendX, PAD, linkLegendW, linkLegendH);
+    linkEntries.forEach(([color, dashed, label], i) => {
+      addNode("", `endArrow=none;html=1;strokeColor=${color};` + (dashed ? "dashed=1;" : ""),
+        linkLegendX + PAD, PAD + TITLE_H + PAD + i * 24 + 10, 40, 1);
+      addNode(label, "text;html=1;align=left;verticalAlign=middle;fontSize=12;",
+        linkLegendX + PAD + 50, PAD + TITLE_H + PAD + i * 24, linkLegendW - PAD - 50, 20);
+    });
+  }
+
+  // ---- Subnets: left-to-right, hosts in a roughly-square grid within each,
+  // plus (when hasTopology) router links between them ----
+  const subnetRowY = PAD + Math.max(legendH, kindLegendH, linkLegendH) + 40;
+  const topologyLayout = computeTopologyLayout(subnets, hosts, hasTopology ? topology : null, subnetRowY);
+  topologyLayout.topology = hasTopology ? topology : null;
+  const { boxes } = topologyLayout.subnetLayout;
+
+  for (const box of boxes) {
+    addNode(subnetDisplayLabel(box.subnet), CONTAINER_STYLE, box.x, box.y, box.w, box.h);
+    if (box.hostCells.length === 0) {
       addNode(
         "no hosts",
         "whiteSpace=wrap;html=1;strokeWidth=1;fillColor=#ffffff;strokeColor=#999999;fontColor=#666666;fontSize=12;fontStyle=2;",
-        x + PAD, subnetRowY + TITLE_H + PAD, CELL_W, ICON_H,
+        box.x + PAD, box.y + TITLE_H + PAD, LAYOUT.CELL_W, ICON_H,
       );
     } else {
-      snHosts.forEach((h, i) => {
-        const col = i % cols;
-        const row = Math.floor(i / cols);
-        const c = STATUS_FILL[mermaidStatusClass(h.status)];
-        const cellX = x + PAD + col * (CELL_W + CELL_GAP_X);
-        const cellY = subnetRowY + TITLE_H + PAD + row * (CELL_H + CELL_GAP_Y);
-        addNode(
-          drawioHostLabel(h),
-          iconStyle(HOST_KIND_SHAPE[inferHostKind(h)], c.fill, c.stroke, "#333333"),
-          cellX + (CELL_W - ICON_W) / 2, cellY, ICON_W, ICON_H,
-        );
-      });
+      for (const cell of box.hostCells) {
+        const c = STATUS_FILL[mermaidStatusClass(cell.host.status)];
+        // The host this app itself is running on (see
+        // computeTopologyLayout's originHostId) gets a distinct green
+        // outline instead of the usual status-tinted one — same
+        // highlight-in-place the Map view gives it, no separate node.
+        const isOrigin = cell.host.id === topologyLayout.originHostId;
+        const stroke = isOrigin ? "#2e9e4f" : c.stroke;
+        const label = drawioHostLabel(cell.host) + (isOrigin ? "\n(this host)" : "");
+        addNode(label, drawioIconStyle(HOST_KIND_SHAPE[inferHostKind(cell.host)], c.fill, stroke, "#333333"), cell.x, cell.y, cell.w, cell.h);
+      }
     }
-    x += subnetW + SUBNET_GAP_X;
   }
 
+  if (hasTopology) addTopologyLinksToDrawio(topologyLayout, addNode, addEdgePath);
+
   // ---- Ports table ----
-  const tableY = subnetRowY + maxSubnetH + 40;
-  const tableW = Math.max(x - SUBNET_GAP_X - PAD, 700);
+  const tableY = topologyLayout.totalHeight + 40;
+  const tableW = Math.max(topologyLayout.totalWidth, 700);
   const tableH = 30 + (hosts.length + 1) * 26;
   addNode(
     buildHostPortsTableHtml(subnets, hosts),
@@ -2416,12 +3283,21 @@ ${cells.join("\n")}
 }
 
 /** Downloads the draw.io export for every non-hidden subnet/host — same
- * scope as downloadMermaidDiagram. */
-function downloadDrawioDiagram() {
+ * scope as downloadMermaidDiagram. Fetches the topology graph fresh (rather
+ * than relying on state.topology, which is only ever populated by visiting
+ * the Map view) so router links show up in the export even if the user
+ * never opened that view this session; a fetch failure or "nothing scanned
+ * yet" (404/empty) just falls back to the plain subnet/host grid this
+ * export always produced. */
+async function downloadDrawioDiagram() {
   const subnets = state.subnets.filter((sn) => !sn.hidden);
   const subnetIds = new Set(subnets.map((sn) => sn.id));
   const hosts = state.hosts.filter((h) => subnetIds.has(h.subnetId));
-  downloadBlob(new Blob([buildDrawioDiagram(subnets, hosts)], { type: "application/xml" }), `network-map-${exportTimestamp()}.drawio`);
+  let topology = null;
+  try {
+    topology = await Api.topology();
+  } catch (_) { /* export still works without router links */ }
+  downloadBlob(new Blob([buildDrawioDiagram(subnets, hosts, topology)], { type: "application/xml" }), `network-map-${exportTimestamp()}.drawio`);
 }
 
 /** "Export ▾" mirrors the "Import ▾" menu right next to it:
@@ -2578,6 +3454,10 @@ function wireTopbar() {
   qs("#btnScanReverseDns").addEventListener("click", () => {
     scanMenu.hidden = true;
     openScanConfirmModal("dns");
+  });
+  qs("#btnScanTopology").addEventListener("click", () => {
+    scanMenu.hidden = true;
+    openScanConfirmModal("topology");
   });
 
   qs("#btnAddSubnet").addEventListener("click", () => openSubnetModal(null));
@@ -2885,6 +3765,14 @@ const SCAN_CONFIRM_COPY = {
     api: () => Api.reverseDnsScanAll(),
     toastMessage: "Reverse DNS scan triggered — sweeping every address for a PTR record.",
   },
+  topology: {
+    title: "Topology scan (traceroute)",
+    body: "This traces the path from this host to one representative host in every subnet (an inferred gateway where possible) using traceroute, to discover the router links shown on the Map view. Requires traceroute to be installed — check the tools icon in the top bar. After it finishes, use \"Refresh topology\" on the Map view to see the results.",
+    confirmLabel: "I understand this requires traceroute and traces every subnet",
+    proceedLabel: "Start topology scan",
+    api: () => Api.topologyScanAll(),
+    toastMessage: "Topology scan triggered — tracing the path to one host per subnet.",
+  },
 };
 
 let pendingScanMode = null; // "mass" | "deep" — which one Proceed should run
@@ -3102,6 +3990,7 @@ async function startApp() {
   wireGraphControls();
   wireViewToggle();
   wireZoomControls();
+  wireMapView();
   wireFilters();
   wireMiniDash();
   wireNotifications();

@@ -105,9 +105,23 @@ CREATE TABLE IF NOT EXISTS risk_rules (
 	version_below TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS topology_hops (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	subnet_id INTEGER NOT NULL REFERENCES subnets(id) ON DELETE CASCADE,
+	hop_index INTEGER NOT NULL,
+	ip TEXT NOT NULL DEFAULT '',
+	responded INTEGER NOT NULL DEFAULT 1,
+	rtt_ms REAL NOT NULL DEFAULT 0,
+	loss_pct REAL NOT NULL DEFAULT 0,
+	method TEXT NOT NULL DEFAULT 'traceroute',
+	scanned_at DATETIME NOT NULL,
+	UNIQUE(subnet_id, hop_index)
+);
+
 CREATE INDEX IF NOT EXISTS idx_hosts_subnet ON hosts(subnet_id);
 CREATE INDEX IF NOT EXISTS idx_ports_host ON ports(host_id);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(timestamp);
+CREATE INDEX IF NOT EXISTS idx_topology_hops_subnet ON topology_hops(subnet_id);
 `
 
 // Open creates the SQLite database the tool runs on. With an empty path it's

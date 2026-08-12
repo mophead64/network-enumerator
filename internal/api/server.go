@@ -92,7 +92,11 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/scan/mass", auth(s.triggerMassScan))
 	mux.HandleFunc("POST /api/scan/deep", auth(s.triggerDeepScan))
 	mux.HandleFunc("POST /api/scan/reverse-dns", auth(s.triggerReverseDNSScan))
+	mux.HandleFunc("POST /api/scan/topology", auth(s.triggerTopologyScan))
 	mux.HandleFunc("GET /api/scan/status", auth(s.scanStatus))
+
+	mux.HandleFunc("GET /api/topology", auth(s.getTopology))
+	mux.HandleFunc("POST /api/topology/mtr", auth(s.runTopologyMTR))
 }
 
 // ---- subnets ----

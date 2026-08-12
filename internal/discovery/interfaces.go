@@ -10,6 +10,41 @@ type LocalSubnet struct {
 	Iface string
 }
 
+// LocalIPs returns the IPv4 addresses actually assigned to this host's own
+// network interfaces — not the network/subnet address LocalSubnets reports,
+// the literal address this machine answers on. Used to identify which
+// already-discovered host, if any, is this machine itself (the Map view's
+// "this host" highlight — see BuildTopologyGraph's trace origin).
+func LocalIPs() ([]string, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+
+	var out []string
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipNet, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip4 := ipNet.IP.To4()
+			if ip4 == nil || ip4.IsLoopback() || ip4.IsLinkLocalUnicast() {
+				continue
+			}
+			out = append(out, ip4.String())
+		}
+	}
+	return out, nil
+}
+
 // LocalSubnets enumerates the IPv4 subnets this host is directly connected
 // to, by inspecting its network interfaces. Loopback and link-local
 // interfaces are skipped since scanning them is never useful.

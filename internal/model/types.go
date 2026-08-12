@@ -137,12 +137,32 @@ type ScanStatus struct {
 }
 
 // ToolStatus reports whether one optional external scanning tool (nmap,
-// netdiscover, dnsrecon) is installed on this host, and where — shown in the
-// topbar so it's obvious up front why, say, ARP-only hosts or mass/deep
-// scans aren't available rather than that only surfacing as a failed
-// request later.
+// netdiscover, dnsrecon, traceroute, mtr) is installed on this host, and
+// where — shown in the topbar so it's obvious up front why, say, ARP-only
+// hosts or mass/deep/topology scans aren't available rather than that only
+// surfacing as a failed request later.
 type ToolStatus struct {
 	Name      string `json:"name"`
 	Available bool   `json:"available"`
 	Path      string `json:"path,omitempty"`
+}
+
+// TopologyHop is one hop along the traced path to subnetID's target host
+// (see Scanner.scanTopology) — the raw material discovery.BuildTopologyGraph
+// classifies against known subnet CIDRs to build the subnet-to-subnet link
+// graph the Map view and draw.io export draw. HopIndex is 1-based, matching
+// the tool's own numbering. A hop that timed out (Responded false) has no
+// IP/RTT — traceroute reports it as "* * *" but the hop count still counts
+// toward the path length, so it's kept as a placeholder row rather than
+// dropped.
+type TopologyHop struct {
+	ID        int64     `json:"id"`
+	SubnetID  int64     `json:"subnetId"`
+	HopIndex  int       `json:"hopIndex"`
+	IP        string    `json:"ip,omitempty"`
+	Responded bool      `json:"responded"`
+	RTTMs     float64   `json:"rttMs,omitempty"`
+	LossPct   float64   `json:"lossPct,omitempty"`
+	Method    string    `json:"method"` // "traceroute" | "mtr"
+	ScannedAt time.Time `json:"scannedAt"`
 }
